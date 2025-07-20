@@ -15,6 +15,7 @@ import torch
 
 from contextualized.functions import LINK_FUNCTIONS
 from contextualized.regression import REGULARIZERS, LOSSES
+from contextualized.regression.losses import MSE
 
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_N_BOOTSTRAPS = 1
@@ -567,14 +568,35 @@ class SKLearnWrapper:
         for bootstrap in range(self.n_bootstraps):
             model_args = organized_kwargs["model"]
             model = self.base_constructor(
+                # universal args
                 context_dim=model_args["context_dim"],
                 x_dim=model_args["x_dim"],
                 y_dim=model_args["y_dim"],
+                univariate=model_args.get("univariate", False),
                 encoder_type=model_args.get("encoder_type", "mlp"),
                 width=model_args.get("width", 25),
                 layers=model_args.get("layers", 1),
                 link_fn=model_args.get("link_fn", LINK_FUNCTIONS["identity"]),
-                **kwargs, # for one-off args
+                num_archetypes=model_args.get("num_archetypes", 10),
+                # for class ContextualizedRegressionBase
+                learning_rate=model_args.get("learning_rate", 1e-3),
+                metamodel_type=model_args.get("metamodel_type", "subtype"),
+                fit_intercept=model_args.get("fit_intercept", True),
+                loss_fn=model_args.get("loss_fn", MSE),
+                model_regularizer=model_args.get("model_regularizer", REGULARIZERS["none"]),
+                base_y_predictor=model_args.get("base_y_predictor", None),
+                base_param_predictor=model_args.get("base_param_predictor", None),
+                # for class TasksplitMetamodel
+                context_archetypes=model_args.get("context_archetypes", 10),
+                task_archetypes=model_args.get("task_archetypes", 10),
+                context_encoder_type=model_args.get("context_encoder_type", "mlp"),
+                context_width=model_args.get("context_width", 25),
+                context_layers=model_args.get("context_layers", 1),
+                context_link_fn=model_args.get("context_link_fn", LINK_FUNCTIONS["softmax"]),
+                task_encoder_type=model_args.get("task_encoder_type", "mlp"),
+                task_width=model_args.get("task_width", 25),
+                task_layers=model_args.get("task_layers", 1),
+                task_link_fn=model_args.get("task_link_fn", LINK_FUNCTIONS["identity"]),
             )
             train_data, val_data = self._split_train_data(
                 *args, **organized_kwargs["data"]
