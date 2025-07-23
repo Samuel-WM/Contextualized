@@ -16,7 +16,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from typing import Callable
 
 from contextualized.regression.regularizers import REGULARIZERS
 from contextualized.regression.losses import MSE
@@ -46,19 +45,35 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
     def __init__(
         self,
+        # universal args
         context_dim: int,
         x_dim: int,
         y_dim: int,
+        univariate: bool = False,
         encoder_type: str = "mlp",
-        learning_rate=1e-3,
-        metamodel_type="subtype",
-        fit_intercept=True,
-        link_fn=LINK_FUNCTIONS["identity"],
-        loss_fn=MSE,
-        model_regularizer=REGULARIZERS["none"],
-        base_y_predictor=None,
-        base_param_predictor=None,
-        **kwargs,
+        width: int = 25,
+        layers: int = 1,
+        num_archetypes: int = 10,
+        # for class ContextualizedRegressionBase
+        learning_rate: float = 1e-3,
+        metamodel_type: str = "subtype",
+        fit_intercept: bool = True,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        loss_fn: callable = MSE,
+        model_regularizer: callable = REGULARIZERS["none"],
+        base_y_predictor: callable = None,
+        base_param_predictor: callable = None,
+        # for class TasksplitMetamodel
+        context_archetypes: int = 10,
+        task_archetypes: int = 10,
+        context_encoder_type: str = "mlp",
+        context_width: int = 25,
+        context_layers: int = 1,
+        context_link_fn: callable = LINK_FUNCTIONS["softmax"],
+        task_encoder_type: str = "mlp",
+        task_width: int = 25,
+        task_layers: int = 1,
+        task_link_fn: callable = LINK_FUNCTIONS["identity"],
     ):
         super().__init__()
         self.learning_rate = learning_rate
@@ -70,11 +85,27 @@ class ContextualizedRegressionBase(pl.LightningModule):
         self.base_y_predictor = base_y_predictor
         self.base_param_predictor = base_param_predictor
         self._build_metamodel(
+            # universal args
             context_dim,
             x_dim,
             y_dim,
+            univariate=univariate,
             encoder_type=encoder_type,
-            **kwargs,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,
+            # for class TasksplitMetamodel
+            context_archetypes=context_archetypes,
+            task_archetypes=task_archetypes,
+            context_encoder_type=context_encoder_type,
+            context_width=context_width,
+            context_layers=context_layers,
+            context_link_fn=context_link_fn,
+            task_encoder_type=task_encoder_type,
+            task_width=task_width,
+            task_layers=task_layers,
+            task_link_fn=task_link_fn,
         )
 
     @abstractmethod
@@ -83,26 +114,38 @@ class ContextualizedRegressionBase(pl.LightningModule):
         context_dim: int,
         x_dim: int,
         y_dim: int,
+        univariate: bool = False,
         encoder_type: str = "mlp",
-        **kwargs,
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
+        :param univariate: Whether to use univariate regression (default is False)
         :param encoder_type: Type of encoder to use (default is "mlp")
-        :param **kwargs: Additional keyword arguments for the metamodel
+        :param width: Width of the encoder (default is 25)
+        :param layers: Number of layers in the encoder (default is 1)
+        :param link_fn: Link function to apply to the output of the encoder (default is "identity")
+        :param num_archetypes: Number of archetypes to use in the model (default is 10)
 
         """
         # builds the metamodel
+        # no tasksplit metamodel here
         self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
             context_dim,
             x_dim,
             y_dim,
+            univariate=univariate,
             encoder_type=encoder_type,
-            univariate=False,
-            **kwargs,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,    
         )
 
     @abstractmethod
@@ -262,24 +305,33 @@ class NaiveContextualizedRegression(ContextualizedRegressionBase):
         context_dim: int,
         x_dim: int,
         y_dim: int,
+        univariate: bool = False,
         encoder_type: str = "mlp",
-        **kwargs,
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
+        :param univariate: Whether to use univariate regression (default is False)
         :param encoder_type: Type of encoder to use (default is "mlp")
+        :param width: Width of the encoder (default is 25)
+        :param layers: Number of layers in the encoder (default is 1)
+        :param link_fn: Link function to use (default is identity)
 
         """
         self.metamodel = NaiveMetamodel(
             context_dim,
             x_dim,
             y_dim,
+            univariate=univariate,
             encoder_type=encoder_type,
-            univariate=False,
-            **kwargs,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -352,28 +404,40 @@ class ContextualizedRegression(ContextualizedRegressionBase):
     """Supports SubtypeMetamodel and NaiveMetamodel, see selected metamodel for docs"""
 
     def _build_metamodel(
-        self, 
+        self,
         context_dim: int,
         x_dim: int,
         y_dim: int,
+        univariate: bool = False,
         encoder_type: str = "mlp",
-        **kwargs,
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
+        :param univariate: Whether to use univariate regression (default is False)
         :param encoder_type: Type of encoder to use (default is "mlp")
+        :param width: Width of the encoder (default is 25)
+        :param layers: Number of layers in the encoder (default is 1)
+        :param link_fn: Link function to apply to the output of the encoder (default is "identity")
+        :param num_archetypes: Number of archetypes to use in the model (default is 10)
 
         """
         self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
             context_dim,
             x_dim,
             y_dim,
+            univariate=univariate,
             encoder_type=encoder_type,
-            univariate=False,
-            **kwargs,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -455,24 +519,36 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
         context_dim: int,
         x_dim: int,
         y_dim: int,
+        univariate: bool = False,
         encoder_type: str = "mlp",
-        **kwargs,
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
+        :param univariate: Whether to use univariate regression (default is False)
         :param encoder_type: Type of encoder to use (default is "mlp")
+        :param width: Width of the encoder (default is 25)
+        :param layers: Number of layers in the encoder (default is 1)
+        :param link_fn: Link function to apply to the output of the encoder (default is "identity")
+        :param num_archetypes: Number of archetypes to use in the model (default is 10)
 
         """
         self.metamodel = MultitaskMetamodel(
             context_dim,
             x_dim,
             y_dim,
+            univariate=univariate,
             encoder_type=encoder_type,
-            univariate=False,
-            **kwargs,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,    
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -549,24 +625,51 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
         context_dim: int,
         x_dim: int,
         y_dim: int,
-        encoder_type: str = "mlp",
-        **kwargs,
+        univariate: bool = False,
+        context_archetypes: int = 10,
+        task_archetypes: int = 10,
+        context_encoder_type: str = "mlp",
+        context_width: int = 25,
+        context_layers: int = 1,
+        context_link_fn: callable = LINK_FUNCTIONS["softmax"],
+        task_encoder_type: str = "mlp",
+        task_width: int = 25,
+        task_layers: int = 1,
+        task_link_fn: callable = LINK_FUNCTIONS["identity"], 
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
-        :param encoder_type: Type of encoder to use (default is "mlp")
+        :param univariate: Whether to use univariate regression (default is False)
+        :param context_archetypes: Number of archetypes for the context (default is 10)
+        :param task_archetypes: Number of archetypes for the task (default is 10)
+        :param context_encoder_type: Type of encoder to use for the context (default is "mlp")
+        :param context_width: Width of the context encoder (default is 25)
+        :param context_layers: Number of layers in the context encoder (default is 1)
+        :param context_link_fn: Link function to use for the context (default is softmax)
+        :param task_encoder_type: Type of encoder to use for the task (default is "mlp")
+        :param task_width: Width of the task encoder (default is 25)
+        :param task_layers: Number of layers in the task encoder (default is 1)
+        :param task_link_fn: Link function to use for the task (default is identity)
 
         """
         self.metamodel = TasksplitMetamodel(
             context_dim,
             x_dim,
             y_dim,
-            encoder_type=encoder_type,
-            univariate=False,
-            **kwargs,
+            univariate=univariate,
+            context_archetypes=context_archetypes,
+            task_archetypes=task_archetypes,
+            context_encoder_type=context_encoder_type,
+            context_width=context_width,
+            context_layers=context_layers,
+            context_link_fn=context_link_fn,
+            task_encoder_type=task_encoder_type,
+            task_width=task_width,
+            task_layers=task_layers,
+            task_link_fn=task_link_fn,
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -643,24 +746,36 @@ class ContextualizedUnivariateRegression(ContextualizedRegression):
         context_dim: int,
         x_dim: int,
         y_dim: int,
+        univariate: bool = False,
         encoder_type: str = "mlp",
-        **kwargs,
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
+        :param univariate: Whether to use univariate regression (default is False)
         :param encoder_type: Type of encoder to use (default is "mlp")
+        :param width: Width of the encoder (default is 25)
+        :param layers: Number of layers in the encoder (default is 1)
+        :param link_fn: Link function to apply to the output of the encoder (default is "identity")
+        :param num_archetypes: Number of archetypes to use in the model (default is 10)
 
         """
         self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
             context_dim,
             x_dim,
             y_dim,
+            univariate=univariate,
             encoder_type=encoder_type,
-            univariate=True,
-            **kwargs,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,
         )
 
     def _params_reshape(self, preds, dataloader):
@@ -713,24 +828,51 @@ class TasksplitContextualizedUnivariateRegression(TasksplitContextualizedRegress
         context_dim: int,
         x_dim: int,
         y_dim: int,
-        encoder_type: str = "mlp",
-        **kwargs,
+        univariate: bool = False,
+        context_archetypes: int = 10,
+        task_archetypes: int = 10,
+        context_encoder_type: str = "mlp",
+        context_width: int = 25,
+        context_layers: int = 1,
+        context_link_fn: callable = LINK_FUNCTIONS["softmax"],
+        task_encoder_type: str = "mlp",
+        task_width: int = 25,
+        task_layers: int = 1,
+        task_link_fn: callable = LINK_FUNCTIONS["identity"], 
     ):
         """
 
         :param context_dim: Dimension of the context vector
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
-        :param encoder_type: Type of encoder to use (default is "mlp")
+        :param univariate: Whether to use univariate regression (default is False)
+        :param context_archetypes: Number of archetypes for the context (default is 10)
+        :param task_archetypes: Number of archetypes for the task (default is 10)
+        :param context_encoder_type: Type of encoder to use for the context (default is "mlp")
+        :param context_width: Width of the context encoder (default is 25)
+        :param context_layers: Number of layers in the context encoder (default is 1)
+        :param context_link_fn: Link function to use for the context (default is softmax)
+        :param task_encoder_type: Type of encoder to use for the task (default is "mlp")
+        :param task_width: Width of the task encoder (default is 25)
+        :param task_layers: Number of layers in the task encoder (default is 1)
+        :param task_link_fn: Link function to use for the task (default is identity)
 
         """
         self.metamodel = TasksplitMetamodel(
             context_dim,
             x_dim,
             y_dim,
-            encoder_type=encoder_type,
-            univariate=True,
-            **kwargs,
+            univariate=univariate,
+            context_archetypes=context_archetypes,
+            task_archetypes=task_archetypes,
+            context_encoder_type=context_encoder_type,
+            context_width=context_width,
+            context_layers=context_layers,
+            context_link_fn=context_link_fn,
+            task_encoder_type=task_encoder_type,
+            task_width=task_width,
+            task_layers=task_layers,
+            task_link_fn=task_link_fn,
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -808,10 +950,28 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
 
     """
 
-    def __init__(self, context_dim, x_dim, **kwargs):
-        if "y_dim" in kwargs:
-            del kwargs["y_dim"]
-        super().__init__(context_dim, x_dim, x_dim, **kwargs)
+    def __init__(
+        self,
+        context_dim: int,
+        x_dim: int,
+        univariate: bool = False,
+        encoder_type: str = "mlp",
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
+    ):
+        super().__init__(
+            context_dim=context_dim,
+            x_dim=x_dim,
+            y_dim=x_dim,
+            univariate=univariate,
+            encoder_type=encoder_type,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,
+        )
 
     def dataloader(self, C, X, Y=None, **kwargs):
         """
@@ -836,10 +996,38 @@ class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegres
 
     """
 
-    def __init__(self, context_dim, x_dim, **kwargs):
-        if "y_dim" in kwargs:
-            del kwargs["y_dim"]
-        super().__init__(context_dim, x_dim, x_dim, **kwargs)
+    def __init__(
+        self,
+        context_dim: int,
+        x_dim: int,
+        univariate: bool = False,
+        context_archetypes: int = 10,
+        task_archetypes: int = 10,
+        context_encoder_type: str = "mlp",
+        context_width: int = 25,
+        context_layers: int = 1,
+        context_link_fn: callable = LINK_FUNCTIONS["softmax"],
+        task_encoder_type: str = "mlp",
+        task_width: int = 25,
+        task_layers: int = 1,
+        task_link_fn: callable = LINK_FUNCTIONS["identity"],
+    ):
+        super().__init__(
+            context_dim=context_dim,
+            x_dim=x_dim,
+            y_dim=x_dim,
+            univariate=univariate,
+            context_archetypes=context_archetypes,
+            task_archetypes=task_archetypes,
+            context_encoder_type=context_encoder_type,
+            context_width=context_width,
+            context_layers=context_layers,
+            context_link_fn=context_link_fn,
+            task_encoder_type=task_encoder_type,
+            task_width=task_width,
+            task_layers=task_layers,
+            task_link_fn=task_link_fn,
+        )
 
     def dataloader(self, C, X, Y=None, **kwargs):
         """
