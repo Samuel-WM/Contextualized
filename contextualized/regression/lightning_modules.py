@@ -960,6 +960,7 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
         layers: int = 1,
         link_fn: callable = LINK_FUNCTIONS["identity"],
         num_archetypes: int = 10,
+        **kwargs, # Allows for additional args to be passed to class ContextualizedRegressionBase
     ):
         super().__init__(
             context_dim=context_dim,
@@ -971,6 +972,7 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
             layers=layers,
             link_fn=link_fn,
             num_archetypes=num_archetypes,
+            **kwargs,
         )
 
     def dataloader(self, C, X, Y=None, **kwargs):
@@ -1011,6 +1013,7 @@ class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegres
         task_width: int = 25,
         task_layers: int = 1,
         task_link_fn: callable = LINK_FUNCTIONS["identity"],
+        **kwargs, # Allows for additional args to be passed to class ContextualizedRegressionBase
     ):
         super().__init__(
             context_dim=context_dim,
@@ -1027,6 +1030,7 @@ class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegres
             task_width=task_width,
             task_layers=task_layers,
             task_link_fn=task_link_fn,
+            **kwargs,
         )
 
     def dataloader(self, C, X, Y=None, **kwargs):
@@ -1052,18 +1056,31 @@ class ContextualizedNeighborhoodSelection(ContextualizedRegression):
 
 
     """
-
     def __init__(
         self,
-        context_dim,
-        x_dim,
-        model_regularizer=REGULARIZERS["l1"](1e-3, mu_ratio=0),
-        **kwargs,
+        context_dim: int,
+        x_dim: int,
+        univariate: bool = False,
+        encoder_type: str = "mlp",
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
+        model_regularizer: callable = REGULARIZERS["l1"](1e-3, mu_ratio=0),
+        **kwargs, # Allows for additional args to be passed to class ContextualizedRegressionBase
     ):
-        if "y_dim" in kwargs:
-            del kwargs["y_dim"]
         super().__init__(
-            context_dim, x_dim, x_dim, model_regularizer=model_regularizer, **kwargs
+            context_dim=context_dim,
+            x_dim=x_dim,
+            y_dim=x_dim,
+            univariate=univariate,
+            encoder_type=encoder_type,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,
+            model_regularizer=model_regularizer,
+            **kwargs,
         )
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
@@ -1104,10 +1121,30 @@ class ContextualizedMarkovGraph(ContextualizedRegression):
 
     """
 
-    def __init__(self, context_dim, x_dim, **kwargs):
-        if "y_dim" in kwargs:
-            del kwargs["y_dim"]
-        super().__init__(context_dim, x_dim, x_dim, **kwargs)
+    def __init__(
+        self,
+        context_dim: int,
+        x_dim: int,
+        univariate: bool = False,
+        encoder_type: str = "mlp",
+        width: int = 25,
+        layers: int = 1,
+        link_fn: callable = LINK_FUNCTIONS["identity"],
+        num_archetypes: int = 10,
+        **kwargs, # Allows for additional args to be passed to class ContextualizedRegressionBase
+    ):
+        super().__init__(
+            context_dim=context_dim,
+            x_dim=x_dim,
+            y_dim=x_dim,
+            univariate=univariate,
+            encoder_type=encoder_type,
+            width=width,
+            layers=layers,
+            link_fn=link_fn,
+            num_archetypes=num_archetypes,
+            **kwargs,
+        )
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
