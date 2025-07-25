@@ -53,6 +53,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
         encoder_type: str = "mlp",
         width: int = 25,
         layers: int = 1,
+        encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
         num_archetypes: int = 10,
         # for class ContextualizedRegressionBase
         learning_rate: float = 1e-3,
@@ -93,7 +94,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
             encoder_type=encoder_type,
             width=width,
             layers=layers,
-            link_fn=link_fn,
+            link_fn=encoder_link_fn,
             num_archetypes=num_archetypes,
             # for class TasksplitMetamodel
             context_archetypes=context_archetypes,
