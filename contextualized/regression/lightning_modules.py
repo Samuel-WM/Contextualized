@@ -50,11 +50,11 @@ class ContextualizedRegressionBase(pl.LightningModule):
         x_dim: int,
         y_dim: int,
         univariate: bool = False,
-        encoder_type: str = "mlp",
-        width: int = 25,
-        layers: int = 1,
-        encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
-        num_archetypes: int = 10,
+        # encoder_type: str = "mlp",
+        # width: int = 25,
+        # layers: int = 1,
+        # encoder_link_fn: callable = LINK_FUNCTIONS["identity"],   
+        # num_archetypes: int = 10,
         # for class ContextualizedRegressionBase
         learning_rate: float = 1e-3,
         metamodel_type: str = "subtype",
@@ -64,17 +64,18 @@ class ContextualizedRegressionBase(pl.LightningModule):
         model_regularizer: callable = REGULARIZERS["none"],
         base_y_predictor: callable = None,
         base_param_predictor: callable = None,
-        # for class TasksplitMetamodel
-        context_archetypes: int = 10,
-        task_archetypes: int = 10,
-        context_encoder_type: str = "mlp",
-        context_width: int = 25,
-        context_layers: int = 1,
-        context_link_fn: callable = LINK_FUNCTIONS["softmax"],
-        task_encoder_type: str = "mlp",
-        task_width: int = 25,
-        task_layers: int = 1,
-        task_link_fn: callable = LINK_FUNCTIONS["identity"],
+        # # for class TasksplitMetamodel
+        # context_archetypes: int = 10,
+        # task_archetypes: int = 10,
+        # context_encoder_type: str = "mlp",
+        # context_width: int = 25,
+        # context_layers: int = 1,
+        # context_link_fn: callable = LINK_FUNCTIONS["softmax"],
+        # task_encoder_type: str = "mlp",
+        # task_width: int = 25,
+        # task_layers: int = 1,
+        # task_link_fn: callable = LINK_FUNCTIONS["identity"],
+        **kwargs,
     ):
         super().__init__()
         self.learning_rate = learning_rate
@@ -91,22 +92,23 @@ class ContextualizedRegressionBase(pl.LightningModule):
             x_dim,
             y_dim,
             univariate=univariate,
-            encoder_type=encoder_type,
-            width=width,
-            layers=layers,
-            link_fn=encoder_link_fn,
-            num_archetypes=num_archetypes,
-            # for class TasksplitMetamodel
-            context_archetypes=context_archetypes,
-            task_archetypes=task_archetypes,
-            context_encoder_type=context_encoder_type,
-            context_width=context_width,
-            context_layers=context_layers,
-            context_link_fn=context_link_fn,
-            task_encoder_type=task_encoder_type,
-            task_width=task_width,
-            task_layers=task_layers,
-            task_link_fn=task_link_fn,
+            # encoder_type=encoder_type,
+            # width=width,
+            # layers=layers,
+            # link_fn=encoder_link_fn,
+            **kwargs,
+            # num_archetypes=num_archetypes,
+            # # for class TasksplitMetamodel
+            # context_archetypes=context_archetypes,
+            # task_archetypes=task_archetypes,
+            # context_encoder_type=context_encoder_type,
+            # context_width=context_width,
+            # context_layers=context_layers,
+            # context_link_fn=context_link_fn,
+            # task_encoder_type=task_encoder_type,
+            # task_width=task_width,
+            # task_layers=task_layers,
+            # task_link_fn=task_link_fn,
         )
 
     @abstractmethod
@@ -310,7 +312,7 @@ class NaiveContextualizedRegression(ContextualizedRegressionBase):
         encoder_type: str = "mlp",
         width: int = 25,
         layers: int = 1,
-        link_fn: callable = LINK_FUNCTIONS["identity"],
+        encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
     ):
         """
 
@@ -332,7 +334,7 @@ class NaiveContextualizedRegression(ContextualizedRegressionBase):
             encoder_type=encoder_type,
             width=width,
             layers=layers,
-            link_fn=link_fn,
+            link_fn=encoder_link_fn,
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -413,7 +415,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         encoder_type: str = "mlp",
         width: int = 25,
         layers: int = 1,
-        link_fn: callable = LINK_FUNCTIONS["identity"],
+        encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
         num_archetypes: int = 10,
     ):
         """
@@ -437,7 +439,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
             encoder_type=encoder_type,
             width=width,
             layers=layers,
-            link_fn=link_fn,
+            link_fn=encoder_link_fn,
             num_archetypes=num_archetypes,
         )
 
@@ -524,7 +526,7 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
         encoder_type: str = "mlp",
         width: int = 25,
         layers: int = 1,
-        link_fn: callable = LINK_FUNCTIONS["identity"],
+        encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
         num_archetypes: int = 10,
     ):
         """
@@ -548,7 +550,7 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
             encoder_type=encoder_type,
             width=width,
             layers=layers,
-            link_fn=link_fn,
+            link_fn=encoder_link_fn,
             num_archetypes=num_archetypes,    
         )
 
