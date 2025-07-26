@@ -45,17 +45,10 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
     def __init__(
         self,
-        # universal args
         context_dim: int,
         x_dim: int,
         y_dim: int,
         univariate: bool = False,
-        # encoder_type: str = "mlp",
-        # width: int = 25,
-        # layers: int = 1,
-        # encoder_link_fn: callable = LINK_FUNCTIONS["identity"],   
-        # num_archetypes: int = 10,
-        # for class ContextualizedRegressionBase
         learning_rate: float = 1e-3,
         metamodel_type: str = "subtype",
         fit_intercept: bool = True,
@@ -64,17 +57,6 @@ class ContextualizedRegressionBase(pl.LightningModule):
         model_regularizer: callable = REGULARIZERS["none"],
         base_y_predictor: callable = None,
         base_param_predictor: callable = None,
-        # # for class TasksplitMetamodel
-        # context_archetypes: int = 10,
-        # task_archetypes: int = 10,
-        # context_encoder_type: str = "mlp",
-        # context_width: int = 25,
-        # context_layers: int = 1,
-        # context_link_fn: callable = LINK_FUNCTIONS["softmax"],
-        # task_encoder_type: str = "mlp",
-        # task_width: int = 25,
-        # task_layers: int = 1,
-        # task_link_fn: callable = LINK_FUNCTIONS["identity"],
         **kwargs,
     ):
         super().__init__()
@@ -87,28 +69,11 @@ class ContextualizedRegressionBase(pl.LightningModule):
         self.base_y_predictor = base_y_predictor
         self.base_param_predictor = base_param_predictor
         self._build_metamodel(
-            # universal args
             context_dim,
             x_dim,
             y_dim,
             univariate=univariate,
-            # encoder_type=encoder_type,
-            # width=width,
-            # layers=layers,
-            # link_fn=encoder_link_fn,
             **kwargs,
-            # num_archetypes=num_archetypes,
-            # # for class TasksplitMetamodel
-            # context_archetypes=context_archetypes,
-            # task_archetypes=task_archetypes,
-            # context_encoder_type=context_encoder_type,
-            # context_width=context_width,
-            # context_layers=context_layers,
-            # context_link_fn=context_link_fn,
-            # task_encoder_type=task_encoder_type,
-            # task_width=task_width,
-            # task_layers=task_layers,
-            # task_link_fn=task_link_fn,
         )
 
     @abstractmethod
@@ -118,11 +83,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
         x_dim: int,
         y_dim: int,
         univariate: bool = False,
-        encoder_type: str = "mlp",
-        width: int = 25,
-        layers: int = 1,
-        link_fn: callable = LINK_FUNCTIONS["identity"],
-        num_archetypes: int = 10,
+        **kwargs,
     ):
         """
 
@@ -130,11 +91,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
         :param x_dim: Dimension of the input features
         :param y_dim: Dimension of the output labels
         :param univariate: Whether to use univariate regression (default is False)
-        :param encoder_type: Type of encoder to use (default is "mlp")
-        :param width: Width of the encoder (default is 25)
-        :param layers: Number of layers in the encoder (default is 1)
-        :param link_fn: Link function to apply to the output of the encoder (default is "identity")
-        :param num_archetypes: Number of archetypes to use in the model (default is 10)
+        :param **kwargs: Additional keyword arguments for the metamodel
 
         """
         # builds the metamodel
@@ -144,11 +101,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
             x_dim,
             y_dim,
             univariate=univariate,
-            encoder_type=encoder_type,
-            width=width,
-            layers=layers,
-            link_fn=link_fn,
-            num_archetypes=num_archetypes,    
+            **kwargs, 
         )
 
     @abstractmethod
@@ -416,7 +369,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         width: int = 25,
         layers: int = 1,
         encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
-        num_archetypes: int = 10,
+        **kwargs,
     ):
         """
 
@@ -440,7 +393,8 @@ class ContextualizedRegression(ContextualizedRegressionBase):
             width=width,
             layers=layers,
             link_fn=encoder_link_fn,
-            num_archetypes=num_archetypes,
+            # num_archetypes=num_archetypes,
+            **kwargs,
         )
 
     def _batch_loss(self, batch, batch_idx):
@@ -753,8 +707,8 @@ class ContextualizedUnivariateRegression(ContextualizedRegression):
         encoder_type: str = "mlp",
         width: int = 25,
         layers: int = 1,
-        link_fn: callable = LINK_FUNCTIONS["identity"],
-        num_archetypes: int = 10,
+        encoder_link_fn: callable = LINK_FUNCTIONS["identity"],
+        **kwargs,
     ):
         """
 
@@ -766,7 +720,6 @@ class ContextualizedUnivariateRegression(ContextualizedRegression):
         :param width: Width of the encoder (default is 25)
         :param layers: Number of layers in the encoder (default is 1)
         :param link_fn: Link function to apply to the output of the encoder (default is "identity")
-        :param num_archetypes: Number of archetypes to use in the model (default is 10)
 
         """
         self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
@@ -777,8 +730,8 @@ class ContextualizedUnivariateRegression(ContextualizedRegression):
             encoder_type=encoder_type,
             width=width,
             layers=layers,
-            link_fn=link_fn,
-            num_archetypes=num_archetypes,
+            link_fn=encoder_link_fn,
+            **kwargs,
         )
 
     def _params_reshape(self, preds, dataloader):
