@@ -15,7 +15,6 @@ import torch
 
 from contextualized.functions import LINK_FUNCTIONS
 from contextualized.regression import REGULARIZERS, LOSSES
-from contextualized.regression.losses import MSE
 
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_N_BOOTSTRAPS = 1

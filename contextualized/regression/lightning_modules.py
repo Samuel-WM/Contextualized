@@ -381,7 +381,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         :param width: Width of the encoder (default is 25)
         :param layers: Number of layers in the encoder (default is 1)
         :param link_fn: Link function to apply to the output of the encoder (default is "identity")
-        :param num_archetypes: Number of archetypes to use in the model (default is 10)
+        :param **kwargs: Additional keyword arguments for the metamodel
 
         """
         self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
@@ -393,7 +393,6 @@ class ContextualizedRegression(ContextualizedRegressionBase):
             width=width,
             layers=layers,
             link_fn=encoder_link_fn,
-            # num_archetypes=num_archetypes,
             **kwargs,
         )
 
@@ -720,6 +719,7 @@ class ContextualizedUnivariateRegression(ContextualizedRegression):
         :param width: Width of the encoder (default is 25)
         :param layers: Number of layers in the encoder (default is 1)
         :param link_fn: Link function to apply to the output of the encoder (default is "identity")
+        :param **kwargs: Additional keyword arguments for the metamodel
 
         """
         self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
