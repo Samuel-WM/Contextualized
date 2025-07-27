@@ -378,6 +378,127 @@ class TestRegression(unittest.TestCase):
         beta_preds, mu_preds = trainer.predict_params(model, dataloader)
         assert (mu_preds == 0).all()
 
+class TestLightningModulesInvalidParams(unittest.TestCase):
+
+    def test_NaiveContextualizedRegression(self):
+        with self.assertRaises(TypeError):
+            NaiveContextualizedRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                encoder_type="mlp",
+                width=64,
+                layers=2,
+                encoder_link_fn=LINK_FUNCTIONS["softmax"],
+                new=True  # ❌ Invalid
+            )
+
+    def test_ContextualizedRegression_task_param(self):
+        with self.assertRaises(TypeError):
+            ContextualizedRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                encoder_type="mlp",
+                width=64,
+                layers=2,
+                encoder_link_fn=LINK_FUNCTIONS["softmax"],
+                task_link_fn=LINK_FUNCTIONS["identity"]  # ❌ Invalid
+            )
+
+    def test_ContextualizedRegression_naive_with_num_archetypes(self):
+        with self.assertRaises(TypeError):
+            ContextualizedRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                encoder_type="mlp",
+                width=64,
+                layers=2,
+                encoder_link_fn=LINK_FUNCTIONS["softmax"],
+                metamodel_type="naive",
+                num_archetypes=10  # ❌ Invalid when metamodel_type is "naive"
+            )
+
+    def test_ContextualizedUnivariateRegression_context_archetypes(self):
+        with self.assertRaises(TypeError):
+            ContextualizedUnivariateRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                encoder_type="mlp",
+                width=64,
+                layers=2,
+                encoder_link_fn=LINK_FUNCTIONS["softmax"],
+                context_archetypes=5  # ❌ Invalid
+            )
+
+    def test_ContextualizedUnivariateRegression_naive_with_num_archetypes(self):
+        with self.assertRaises(TypeError):
+            ContextualizedUnivariateRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                encoder_type="mlp",
+                width=64,
+                layers=2,
+                encoder_link_fn=LINK_FUNCTIONS["softmax"],
+                metamodel_type="naive",
+                num_archetypes=10  # ❌ Invalid when metamodel_type is "naive"
+            )
+
+    def test_MultitaskContextualizedRegression(self):
+        with self.assertRaises(TypeError):
+            MultitaskContextualizedRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                encoder_type="mlp",
+                width=64,
+                layers=2,
+                encoder_link_fn=LINK_FUNCTIONS["softmax"],
+                context_encoder_type="mlp"  # ❌ Invalid
+            )
+
+    def test_TasksplitContextualizedRegression(self):
+        with self.assertRaises(TypeError):
+            TasksplitContextualizedRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                univariate=True,
+                context_archetypes=10,
+                task_archetypes=10,
+                context_encoder_type="mlp",
+                context_width=25,
+                context_layers=2,
+                context_link_fn=LINK_FUNCTIONS["softmax"],
+                task_encoder_type="mlp",
+                task_width=25,
+                task_layers=2,
+                task_link_fn=LINK_FUNCTIONS["identity"],
+                encoder_type="mlp"  # ❌ Invalid
+            )
+
+    def test_TasksplitContextualizedUnivariateRegression(self):
+        with self.assertRaises(TypeError):
+            TasksplitContextualizedUnivariateRegression(
+                context_dim=10,
+                x_dim=2,
+                y_dim=1,
+                univariate=True,
+                context_archetypes=10,
+                task_archetypes=10,
+                context_encoder_type="mlp",
+                context_width=25,
+                context_layers=2,
+                context_link_fn=LINK_FUNCTIONS["softmax"],
+                task_encoder_type="mlp",
+                task_width=25,
+                task_layers=2,
+                task_link_fn=LINK_FUNCTIONS["identity"],
+                num_archetypes=10  # ❌ Invalid
+            )
 
 if __name__ == "__main__":
     unittest.main()
