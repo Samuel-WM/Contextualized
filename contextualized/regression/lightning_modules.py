@@ -951,6 +951,97 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
     #     return self._dataloader(C, X, Y, UnivariateDataset, **kwargs)
 
 
+class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
+    """See MultitaskMetamodel"""
+
+    def __init__(
+        self,
+        context_dim,
+        x_dim,
+        y_dim,
+        num_archetypes=10,
+        encoder_type="mlp",
+        encoder_kwargs={
+            "width": 25,
+            "layers": 1,
+            "link_fn": "identity",
+        },
+        learning_rate=1e-3,
+        fit_intercept=True,
+        link_fn="identity",
+        loss_fn="mse",
+        model_regularizer="none",
+    ):
+        super().__init__()
+        self.learning_rate = learning_rate
+        self.fit_intercept = fit_intercept
+        self.link_fn = LINK_FUNCTIONS[link_fn]
+        if loss_fn == "mse":
+            self.loss_fn = MSE
+        else:
+            raise ValueError("Supported loss_fn's: mse")
+        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.metamodel = MultitaskMetamodel(
+            context_dim=context_dim,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            univariate=True,
+            num_archetypes=num_archetypes,
+            encoder_type=encoder_type,
+            encoder_kwargs=encoder_kwargs,
+        )
+    
+    def forward(self, batch):
+        """
+
+        :param batch:
+
+        """
+        beta, mu = self.metamodel(batch["contexts"], batch["task"])
+        if not self.fit_intercept:
+            mu = torch.zeros_like(mu)
+        # Does not support base_param_predictor
+        return beta, mu
+
+    def _batch_loss(self, batch, batch_idx):
+        """
+
+        :param batch:
+        :param batch_idx:
+
+        """
+        beta_hat, mu_hat = self(batch)
+        pred_loss = self.loss_fn(batch['outcomes'], self._predict_y(batch['contexts'], batch['predictors'], beta_hat, mu_hat))
+        reg_loss = self.model_regularizer(beta_hat, mu_hat)
+        return pred_loss + reg_loss
+    
+    def _predict_y(self, C, X, beta_hat, mu_hat):
+        """
+
+        :param C:
+        :param X:
+        :param beta_hat:
+        :param mu_hat:
+
+        """
+        Y = self._predict_from_models(X, beta_hat, mu_hat)
+        # Does not support base_y_predictor
+        return Y
+
+    def predict_step(self, batch, batch_idx):
+        """
+
+        :param batch:
+        :param batch_idx:
+
+        """ 
+        beta_hat, mu_hat = self(batch)
+        batch.update({
+            "betas": beta_hat.squeeze(-1),
+            "mus": mu_hat.squeeze(-1),
+        })
+        return batch
+
 class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
     """See TasksplitMetamodel"""
 
@@ -974,7 +1065,6 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
             "link_fn": "identity",
         },
         learning_rate=1e-3,
-        metamodel_type="tasksplit",
         fit_intercept=True,
         link_fn="identity",
         loss_fn="mse",
@@ -982,7 +1072,6 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
     ):
         super().__init__()
         self.learning_rate = learning_rate
-        self.metamodel_type = metamodel_type
         self.fit_intercept = fit_intercept
         self.link_fn = LINK_FUNCTIONS[link_fn]
         if loss_fn == "mse":
@@ -1129,6 +1218,19 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
             "correlations": correlations,
         })
         return batch
+
+
+class MultitaskContextualizedCorrelation(MultitaskContextualizedUnivariateRegression):
+    """Using multitask univariate contextualized regression to estimate Pearson's correlation
+    See TasksplitMetamodel for assumptions and full docstring
+
+
+    """
+
+    def __init__(self, context_dim, x_dim, **kwargs):
+        if "y_dim" in kwargs:
+            del kwargs["y_dim"]
+        super().__init__(context_dim, x_dim, x_dim, **kwargs)
 
 
 class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegression):
