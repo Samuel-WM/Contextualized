@@ -161,7 +161,7 @@ class TestRegression(unittest.TestCase):
             self.c_dim,
             self.x_dim,
             self.y_dim,
-             width=25,
+            width=25,
             layers=2,
             encoder_link_fn=LINK_FUNCTIONS["softmax"],
             link_fn=LINK_FUNCTIONS["logistic"],

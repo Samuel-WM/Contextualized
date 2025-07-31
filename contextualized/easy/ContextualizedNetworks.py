@@ -282,9 +282,9 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
                 "encoder_type", self._init_kwargs["model"]["encoder_type"]
             ),
             "params": {
-                "width": self.constructor_kwargs["encoder_kwargs"]["width"],
-                "layers": self.constructor_kwargs["encoder_kwargs"]["layers"],
-                "link_fn": self.constructor_kwargs["encoder_kwargs"]["link_fn"],
+                "width": self.constructor_kwargs["width"],
+                "layers": self.constructor_kwargs["layers"],
+                "link_fn": self.constructor_kwargs["encoder_link_fn"],
             },
         }
 
