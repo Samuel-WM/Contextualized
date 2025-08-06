@@ -98,7 +98,9 @@ class SKLearnWrapper:
                 "link_fn",
                 "univariate",
                 "encoder_type",
-                "encoder_kwargs",
+                "width",
+                "layers",
+                "encoder_link_fn",
                 "model_regularizer",
                 "num_archetypes",
                 "learning_rate",
@@ -142,16 +144,16 @@ class SKLearnWrapper:
             "encoder_link_fn",
         ]
         self.constructor_kwargs = self._organize_constructor_kwargs(**kwargs)
-        self.constructor_kwargs["encoder_kwargs"]["width"] = kwargs.pop(
-            "width", self.constructor_kwargs["encoder_kwargs"]["width"]
+        self.constructor_kwargs["width"] = kwargs.pop(
+            "width", self.constructor_kwargs["width"]
         )
-        self.constructor_kwargs["encoder_kwargs"]["layers"] = kwargs.pop(
-            "layers", self.constructor_kwargs["encoder_kwargs"]["layers"]
+        self.constructor_kwargs["layers"] = kwargs.pop(
+            "layers", self.constructor_kwargs["layers"]
         )
-        self.constructor_kwargs["encoder_kwargs"]["link_fn"] = kwargs.pop(
+        self.constructor_kwargs["encoder_link_fn"] = kwargs.pop(
             "encoder_link_fn",
-            self.constructor_kwargs["encoder_kwargs"].get(
-                "link_fn", self.default_encoder_link_fn
+            self.constructor_kwargs.get(
+                "encoder_link_fn", self.default_encoder_link_fn
             ),
         )
         self.not_constructor_kwargs = {
@@ -303,19 +305,13 @@ class SKLearnWrapper:
                 constructor_kwargs[kwarg] = kwargs.get(kwarg, default_val)
 
         maybe_add_constructor_kwarg("link_fn", LINK_FUNCTIONS["identity"])
-        maybe_add_constructor_kwarg("univariate", False)
         maybe_add_constructor_kwarg("encoder_type", self.default_encoder_type)
         maybe_add_constructor_kwarg("loss_fn", LOSSES["mse"])
-        maybe_add_constructor_kwarg(
-            "encoder_kwargs",
-            {
-                "width": kwargs.get("encoder_width", self.default_encoder_width),
-                "layers": kwargs.get("encoder_layers", self.default_encoder_layers),
-                "link_fn": kwargs.get("encoder_link_fn", self.default_encoder_link_fn),
-            },
-        )
+        maybe_add_constructor_kwarg("width", self.default_encoder_width)
+        maybe_add_constructor_kwarg("layers", self.default_encoder_layers)
+        maybe_add_constructor_kwarg("encoder_link_fn", self.default_encoder_link_fn)
         if kwargs.get("subtype_probabilities", False):
-            constructor_kwargs["encoder_kwargs"]["link_fn"] = LINK_FUNCTIONS["softmax"]
+            constructor_kwargs["encoder_link_fn"] = LINK_FUNCTIONS["softmax"]
 
         # Make regularizer
         if "model_regularizer" in self.acceptable_kwargs["model"]:
@@ -449,7 +445,9 @@ class SKLearnWrapper:
             preds = np.mean(predictions, axis=0)
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
-                preds = np.array([self.scalers["Y"].inverse_transform(p) for p in preds])
+                preds = np.array(
+                    [self.scalers["Y"].inverse_transform(p) for p in preds]
+                )
             else:
                 preds = self.scalers["Y"].inverse_transform(preds)
         return preds
@@ -488,12 +486,11 @@ class SKLearnWrapper:
             get_dataloader = lambda i: self.models[i].dataloader(
                 self._maybe_scale_C(C),
                 np.zeros((len(C), self.x_dim)),
-                np.zeros((len(C), self.y_dim))
+                np.zeros((len(C), self.y_dim)),
             )
         else:
             get_dataloader = lambda i: self.models[i].dataloader(
-                self._maybe_scale_C(C),
-                np.zeros((len(C), self.x_dim))
+                self._maybe_scale_C(C), np.zeros((len(C), self.x_dim))
             )
         predictions = [
             self.trainers[i].predict_params(self.models[i], get_dataloader(i), **kwargs)
