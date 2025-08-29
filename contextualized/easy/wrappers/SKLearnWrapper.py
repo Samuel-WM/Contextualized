@@ -413,7 +413,7 @@ class SKLearnWrapper:
 
     def _nanrobust_mean(self, arr, axis=0):
         """
-        arr : numpy array (may contain NaN/Inf)
+        arr : numpy array (possible NaN/Inf)
         axis : int, axis to average over (default=0)
         """
         
@@ -461,7 +461,9 @@ class SKLearnWrapper:
 
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
-                preds = np.array([self.scalers["Y"].inverse_transform(p) for p in preds])
+                preds = np.array(
+                    [self.scalers["Y"].inverse_transform(p) for p in preds]
+                    )
             else:
                 preds = self.scalers["Y"].inverse_transform(preds)
         return preds
