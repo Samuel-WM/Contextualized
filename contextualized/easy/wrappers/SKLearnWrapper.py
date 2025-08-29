@@ -2,6 +2,9 @@
 An sklearn-like wrapper for Contextualized models.
 """
 
+"""
+sam rules
+"""
 import copy
 import os
 from typing import *
@@ -408,23 +411,28 @@ class SKLearnWrapper:
             return self.scalers["X"].transform(X)
         return X
 
-    def predict(
-        self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
-    ) -> Union[np.ndarray, List[np.ndarray]]:
-        """Predict outcomes from context C and predictors X.
-
-        Args:
-            C (np.ndarray): Context array of shape (n_samples, n_context_features)
-            X (np.ndarray): Predictor array of shape (N, n_features)
-            individual_preds (bool, optional): Whether to return individual predictions for each model. Defaults to False.
-
-        Returns:
-            Union[np.ndarray, List[np.ndarray]]: The outcomes predicted by the context-specific models (n_samples, y_dim). Returned as lists of individual bootstraps if individual_preds is True.
+    def _nanrobust_mean(self, arr, axis=0):
         """
-        if not hasattr(self, "models") or self.models is None:
-            raise ValueError(
-                "Trying to predict with a model that hasn't been trained yet."
+        arr : numpy array (possible NaN/Inf)
+        axis : int, axis to average over (default=0)
+        """
+        
+        if not np.isfinite(arr).all():
+            # convert infs to nans so they can be dropped
+            arr = np.where(np.isfinite(arr), arr, np.nan)
+        with np.errstate(invalid="ignore"):
+            mean = np.nanmean(arr, axis=axis)
+        if np.isnan(mean).any():
+            # all bootstraps failed for an element
+            raise RuntimeError(
+                "All bootstraps produced non-finite predictions for some items. "
             )
+        return mean
+    
+    
+    def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
+        if not hasattr(self, "models") or self.models is None:
+            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
         predictions = np.array(
             [
                 self.trainers[i].predict_y(
@@ -437,20 +445,30 @@ class SKLearnWrapper:
                     **kwargs,
                 )
                 for i in range(len(self.models))
-            ]
+            ],
+            dtype=float,
         )
+        # aggregation across bootstraps
         if individual_preds:
             preds = predictions
         else:
-            preds = np.mean(predictions, axis=0)
+            # warn if any bootstrap produced non finite values
+            bad = ~np.isfinite(predictions)
+            if bad.any():
+                num_bad_boots = np.unique(np.where(bad)[0]).size
+                print(f"Warning: {num_bad_boots}/{len(self.models)} bootstraps produced non-finite predictions; excluding them from the ensemble.")
+            preds = self._nanrobust_mean(predictions, axis=0)
+
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
                 preds = np.array(
                     [self.scalers["Y"].inverse_transform(p) for p in preds]
-                )
+                    )
             else:
                 preds = self.scalers["Y"].inverse_transform(preds)
         return preds
+    
+    
 
     def predict_params(
         self,
