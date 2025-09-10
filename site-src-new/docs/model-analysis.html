@@ -1,0 +1,1201 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+    <title>Analyzing Contextualized Models &#8212; Contextualized Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "light";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.1/css/all.min.css?digest=8d27b9dea8ad943066ae" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.1/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.1/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.1/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css" />
+    <link rel="stylesheet" href="_static/styles/sphinx-book-theme.css?digest=14f4ca6b54d191a8c7657f6c759bf11a5fb86285" type="text/css" />
+    <link rel="stylesheet" type="text/css" href="_static/togglebutton.css" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css" />
+    <link rel="stylesheet" type="text/css" href="_static/mystnb.4510f1fc1dee50b3e5859aac5469c37c29e427902b24a333a5f9fcb2f0b3ac41.css" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-thebe.css" />
+    <link rel="stylesheet" type="text/css" href="_static/design-style.4045f2051d55cab465a707391d5b2007.min.css" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=8d27b9dea8ad943066ae" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=8d27b9dea8ad943066ae" />
+  <script src="_static/vendor/fontawesome/6.5.1/js/all.min.js?digest=8d27b9dea8ad943066ae"></script>
+
+    <script data-url_root="./" id="documentation_options" src="_static/documentation_options.js"></script>
+    <script src="_static/jquery.js"></script>
+    <script src="_static/underscore.js"></script>
+    <script src="_static/_sphinx_javascript_frameworks_compat.js"></script>
+    <script src="_static/doctools.js"></script>
+    <script src="_static/clipboard.min.js"></script>
+    <script src="_static/copybutton.js"></script>
+    <script src="_static/scripts/sphinx-book-theme.js?digest=5a5c038af52cf7bc1a1ec88eea08e6366ee68824"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="_static/togglebutton.js"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="_static/design-tabs.js"></script>
+    <script>const THEBE_JS_URL = "https://unpkg.com/thebe@0.8.2/lib/index.js"
+const thebe_selector = ".thebe,.cell"
+const thebe_selector_input = "pre"
+const thebe_selector_output = ".output, .cell_output"
+</script>
+    <script async="async" src="_static/sphinx-thebe.js"></script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'model-analysis';</script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Under the Hood" href="under-the-hood.html" />
+    <link rel="prev" title="Fitting Contextualized Models" href="model-fitting.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <a id="pst-skip-link" class="skip-link" href="#main-content">Skip to main content</a>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>
+    Back to top
+  </button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          name="__primary"
+          id="__primary"/>
+  <label class="overlay overlay-primary" for="__primary"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          name="__secondary"
+          id="__secondary"/>
+  <label class="overlay overlay-secondary" for="__secondary"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search this book..."
+         aria-label="Search this book..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar">
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+
+<a class="navbar-brand logo" href="intro.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/logo.png" class="logo__image only-light" alt="Contextualized Documentation - Home"/>
+    <script>document.write(`<img src="_static/logo.png" class="logo__image only-dark" alt="Contextualized Documentation - Home"/>`);</script>
+  
+  
+</a></div>
+        <div class="sidebar-primary-item"><nav class="bd-links" id="bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        
+        <ul class="nav bd-sidenav bd-sidenav__home-link">
+            <li class="toctree-l1">
+                <a class="reference internal" href="intro.html">
+                    Contextualized
+                </a>
+            </li>
+        </ul>
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Introduction</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model-fitting.html">Fitting Contextualized Models</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Analyzing Contextualized Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="under-the-hood.html">Under the Hood</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="models/regression_intro.html">Regressions</a><input class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" type="checkbox"/><label class="toctree-toggle" for="toctree-checkbox-1"><i class="fa-solid fa-chevron-down"></i></label><ul>
+<li class="toctree-l2"><a class="reference internal" href="models/easy_regression.html">Contextualized Regression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/easy_classification.html">Contextualized Classification</a></li>
+</ul>
+</li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="models/networks_intro.html">Networks</a><input class="toctree-checkbox" id="toctree-checkbox-2" name="toctree-checkbox-2" type="checkbox"/><label class="toctree-toggle" for="toctree-checkbox-2"><i class="fa-solid fa-chevron-down"></i></label><ul>
+<li class="toctree-l2"><a class="reference internal" href="models/easy_correlation_networks.html">Contextualized Correlation Networks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/easy_markov_networks.html">Contextualized Markov Networks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/easy_bayesian_networks.html">Contextualized Bayesian Networks</a></li>
+
+
+<li class="toctree-l2"><a class="reference internal" href="models/easy_bayesian_networks_factors.html">Low-dimensional Contextualized Bayesian Networks</a></li>
+
+</ul>
+</li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="source/easy.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="source/analysis.html">Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Beyond Basics</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="demos/sequential_testing.html">Finding Drivers of Heterogeneous Effects</a></li>
+<li class="toctree-l1"><a class="reference internal" href="demos/custom_models.html">Death to Cluster Models; Long Live Context Encoders</a></li>
+<li class="toctree-l1"><a class="reference internal" href="demos/benefits.html">Benefits of Contextualized ML</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><label class="sidebar-toggle primary-toggle btn btn-sm" for="__primary" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</label></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/cnellington/contextualized" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/cnellington/contextualized/issues/new?title=Issue%20on%20page%20%2Fmodel-analysis.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="_sources/model-analysis.ipynb" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.ipynb</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm navbar-btn theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="theme-switch nav-link" data-mode="light"><i class="fa-solid fa-sun fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="dark"><i class="fa-solid fa-moon fa-lg"></i></span>
+    <span class="theme-switch nav-link" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg"></i></span>
+  </button>
+`);
+</script>
+
+
+<script>
+document.write(`
+  <button class="btn btn-sm navbar-btn search-button search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+  </button>
+`);
+</script>
+<label class="sidebar-toggle secondary-toggle btn btn-sm" for="__secondary"title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</label>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Analyzing Contextualized Models</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#load-the-trained-model">Load the trained model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inspect-the-model-predictions">Inspect the model predictions.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#check-how-the-individual-bootstrap-models-learned">Check how the individual bootstrap models learned.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#check-what-effects-the-models-learned">Check what effects the models learned.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#homogeneous-vs-heterogeneous-effects">Homogeneous vs. Heterogeneous Effects</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-a-model">What is a Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-a-contextualized-model">What is a Contextualized Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-for-homogeneous-and-heterogeneous-effects">Testing for Homogeneous and Heterogeneous Effects</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#plotting-homogeneous-and-heterogeneous-effects">Plotting Homogeneous and Heterogeneous Effects</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#homogeneous-context-effects-of-diabetes-progression">Homogeneous Context Effects of Diabetes Progression</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#homogeneous-predictor-effects-on-diabetes-progression">Homogeneous Predictor Effects on Diabetes Progression</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#heterogeneous-predictor-effects-on-diabetes-progression">Heterogeneous Predictor Effects on Diabetes Progression</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="analyzing-contextualized-models">
+<h1>Analyzing Contextualized Models<a class="headerlink" href="#analyzing-contextualized-models" title="Permalink to this heading">#</a></h1>
+<p>In the previous step, we applied applied contextualized linear regression models to diabetes data. Here, we analyze these models to determine homogeneous and heterogeneous predictors of diabetes progression, i.e. what predictors are consistent across patients vs. what predictors change according to an individual’s context.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="c1"># Reload the same data as before</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">pandas</span> <span class="k">as</span> <span class="nn">pd</span>
+<span class="kn">from</span> <span class="nn">sklearn.model_selection</span> <span class="kn">import</span> <span class="n">train_test_split</span>
+<span class="kn">from</span> <span class="nn">sklearn.datasets</span> <span class="kn">import</span> <span class="n">load_diabetes</span>
+
+<span class="c1"># Load data</span>
+<span class="n">X</span><span class="p">,</span> <span class="n">Y</span> <span class="o">=</span> <span class="n">load_diabetes</span><span class="p">(</span><span class="n">return_X_y</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">as_frame</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">Y</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">expand_dims</span><span class="p">(</span><span class="n">Y</span><span class="o">.</span><span class="n">values</span><span class="p">,</span> <span class="n">axis</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="c1"># Decide context variables, or use other paired data as context</span>
+<span class="n">C</span> <span class="o">=</span> <span class="n">X</span><span class="p">[[</span><span class="s1">&#39;age&#39;</span><span class="p">,</span> <span class="s1">&#39;sex&#39;</span><span class="p">,</span> <span class="s1">&#39;bmi&#39;</span><span class="p">]]</span>
+<span class="n">X</span><span class="o">.</span><span class="n">drop</span><span class="p">([</span><span class="s1">&#39;age&#39;</span><span class="p">,</span> <span class="s1">&#39;sex&#39;</span><span class="p">,</span> <span class="s1">&#39;bmi&#39;</span><span class="p">],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">inplace</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># Create a hold-out test set</span>
+<span class="n">seed</span> <span class="o">=</span> <span class="mi">1</span>
+<span class="n">C_train</span><span class="p">,</span> <span class="n">C_test</span><span class="p">,</span> <span class="n">X_train</span><span class="p">,</span> <span class="n">X_test</span><span class="p">,</span> <span class="n">Y_train</span><span class="p">,</span> <span class="n">Y_test</span> <span class="o">=</span> <span class="n">train_test_split</span><span class="p">(</span><span class="n">C</span><span class="p">,</span> <span class="n">X</span><span class="p">,</span> <span class="n">Y</span><span class="p">,</span> <span class="n">test_size</span><span class="o">=</span><span class="mf">0.20</span><span class="p">,</span> <span class="n">random_state</span><span class="o">=</span><span class="n">seed</span><span class="p">)</span>
+
+<span class="c1"># Normalize the data</span>
+<span class="k">def</span> <span class="nf">normalize</span><span class="p">(</span><span class="n">train</span><span class="p">,</span> <span class="n">test</span><span class="p">):</span>
+    <span class="n">mean</span> <span class="o">=</span> <span class="n">train</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+    <span class="n">std</span> <span class="o">=</span> <span class="n">train</span><span class="o">.</span><span class="n">std</span><span class="p">()</span>
+    <span class="n">train</span> <span class="o">=</span> <span class="p">(</span><span class="n">train</span> <span class="o">-</span> <span class="n">mean</span><span class="p">)</span> <span class="o">/</span> <span class="n">std</span>
+    <span class="n">test</span> <span class="o">=</span> <span class="p">(</span><span class="n">test</span> <span class="o">-</span> <span class="n">mean</span><span class="p">)</span> <span class="o">/</span> <span class="n">std</span>
+    <span class="k">return</span> <span class="n">train</span><span class="p">,</span> <span class="n">test</span>
+<span class="n">X_train</span><span class="p">,</span> <span class="n">X_test</span> <span class="o">=</span> <span class="n">normalize</span><span class="p">(</span><span class="n">X_train</span><span class="p">,</span> <span class="n">X_test</span><span class="p">)</span>
+<span class="n">C_train</span><span class="p">,</span> <span class="n">C_test</span> <span class="o">=</span> <span class="n">normalize</span><span class="p">(</span><span class="n">C_train</span><span class="p">,</span> <span class="n">C_test</span><span class="p">)</span>
+<span class="n">Y_train</span><span class="p">,</span> <span class="n">Y_test</span> <span class="o">=</span> <span class="n">normalize</span><span class="p">(</span><span class="n">Y_train</span><span class="p">,</span> <span class="n">Y_test</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+</div>
+<section id="load-the-trained-model">
+<h2>Load the trained model<a class="headerlink" href="#load-the-trained-model" title="Permalink to this heading">#</a></h2>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">contextualized.utils</span> <span class="kn">import</span> <span class="n">load</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">load</span><span class="p">(</span><span class="s1">&#39;my_contextualized_model.pt&#39;</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+</div>
+</section>
+<section id="inspect-the-model-predictions">
+<h2>Inspect the model predictions.<a class="headerlink" href="#inspect-the-model-predictions" title="Permalink to this heading">#</a></h2>
+<p>We can use standard plotting tools to inspect the model predictions.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="o">%%capture</span>
+<span class="n">Y_pred</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">predict</span><span class="p">(</span><span class="n">C_test</span><span class="o">.</span><span class="n">values</span><span class="p">,</span> <span class="n">X_test</span><span class="o">.</span><span class="n">values</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">matplotlib.pyplot</span> <span class="k">as</span> <span class="nn">plt</span>
+<span class="o">%</span><span class="k">matplotlib</span> inline
+<span class="n">plt</span><span class="o">.</span><span class="n">rcParams</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s1">&#39;font.size&#39;</span><span class="p">:</span> <span class="mi">18</span><span class="p">})</span>
+
+<span class="n">plt</span><span class="o">.</span><span class="n">scatter</span><span class="p">(</span><span class="n">Y_test</span><span class="p">,</span> <span class="n">Y_pred</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">xlabel</span><span class="p">(</span><span class="s2">&quot;True Diabetes Progression&quot;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">ylabel</span><span class="p">(</span><span class="s2">&quot;Predicted Diabetes Progression&quot;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">show</span><span class="p">()</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<img alt="_images/86aa7892abbb36b4e854c0b0a1a93b3f61d9ff3efa24a48a540a5cb4c5480116.png" src="_images/86aa7892abbb36b4e854c0b0a1a93b3f61d9ff3efa24a48a540a5cb4c5480116.png" />
+</div>
+</div>
+</section>
+<section id="check-how-the-individual-bootstrap-models-learned">
+<h2>Check how the individual bootstrap models learned.<a class="headerlink" href="#check-how-the-individual-bootstrap-models-learned" title="Permalink to this heading">#</a></h2>
+<p>Since we’re bootstrapping for robustness, we can also access individual bootstrap runs with the <code class="docutils literal notranslate"><span class="pre">individual_preds</span></code> keyword to get confidence intervals.
+Below we plot the standard deviation for each one of the test-point predictions.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="o">%%capture</span>
+<span class="n">Y_preds</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">predict</span><span class="p">(</span><span class="n">C_test</span><span class="o">.</span><span class="n">values</span><span class="p">,</span> <span class="n">X_test</span><span class="o">.</span><span class="n">values</span><span class="p">,</span> <span class="n">individual_preds</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">Y_preds</span><span class="o">.</span><span class="n">shape</span>  <span class="c1"># (n_bootstraps, n_samples, n_outputs)</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="c1"># Squeeze the n_output dimension, we only have one output here.</span>
+<span class="n">Y_test</span> <span class="o">=</span> <span class="n">Y_test</span><span class="o">.</span><span class="n">squeeze</span><span class="p">()</span>
+<span class="n">Y_preds</span> <span class="o">=</span> <span class="n">Y_preds</span><span class="o">.</span><span class="n">squeeze</span><span class="p">()</span>
+
+<span class="n">plt</span><span class="o">.</span><span class="n">plot</span><span class="p">(</span><span class="n">Y_test</span><span class="p">,</span> <span class="n">Y_test</span><span class="p">,</span> <span class="n">color</span><span class="o">=</span><span class="s1">&#39;black&#39;</span><span class="p">,</span> <span class="n">linestyle</span><span class="o">=</span><span class="s1">&#39;--&#39;</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s1">&#39;Perfect&#39;</span><span class="p">)</span>
+<span class="c1"># Set the legend entry using the first datapoint. The rest will be the same.</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">errorbar</span><span class="p">(</span><span class="n">Y_test</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">Y_preds</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span>
+            <span class="n">yerr</span><span class="o">=</span><span class="mi">2</span><span class="o">*</span><span class="n">np</span><span class="o">.</span><span class="n">std</span><span class="p">(</span><span class="n">Y_preds</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span> <span class="n">color</span><span class="o">=</span><span class="s1">&#39;blue&#39;</span><span class="p">,</span>
+            <span class="n">label</span><span class="o">=</span><span class="s1">&#39;Predicted&#39;</span><span class="p">)</span>
+<span class="c1"># Make scatter plot points with only error bars</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">Y_preds</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]):</span>
+    <span class="n">plt</span><span class="o">.</span><span class="n">errorbar</span><span class="p">(</span><span class="n">Y_test</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">Y_preds</span><span class="p">[:,</span> <span class="n">i</span><span class="p">],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span>
+                <span class="n">yerr</span><span class="o">=</span><span class="mi">2</span><span class="o">*</span><span class="n">np</span><span class="o">.</span><span class="n">std</span><span class="p">(</span><span class="n">Y_preds</span><span class="p">[:,</span> <span class="n">i</span><span class="p">],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span> <span class="n">color</span><span class="o">=</span><span class="s1">&#39;blue&#39;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">xlabel</span><span class="p">(</span><span class="s2">&quot;True Diabetes Progresion&quot;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">ylabel</span><span class="p">(</span><span class="s2">&quot;Predicted Diabetes Progression&quot;</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">legend</span><span class="p">(</span><span class="n">fontsize</span><span class="o">=</span><span class="mi">12</span><span class="p">)</span>
+<span class="n">plt</span><span class="o">.</span><span class="n">show</span><span class="p">()</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<img alt="_images/19c5d8df78368f3291fbe681e93c55649582be5bac850a1ea8c1e777fde50843.png" src="_images/19c5d8df78368f3291fbe681e93c55649582be5bac850a1ea8c1e777fde50843.png" />
+</div>
+</div>
+</section>
+<section id="check-what-effects-the-models-learned">
+<h2>Check what effects the models learned.<a class="headerlink" href="#check-what-effects-the-models-learned" title="Permalink to this heading">#</a></h2>
+<p>Now, let’s look at the contextualized models we’re using to make these predictions.
+We can extract the predicted context-specific model parameters and visualize them to see what effects the models learned.
+To get a sense of how the models are clustered and how contexts affect parameters, let’s embed the model parameters in a 2-D space and visualize them according to each context feature.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="o">%%capture</span>
+<span class="n">coefs</span><span class="p">,</span> <span class="n">offsets</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">predict_params</span><span class="p">(</span><span class="n">C</span><span class="o">.</span><span class="n">values</span><span class="p">,</span> <span class="n">individual_preds</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">coefs</span><span class="o">.</span><span class="n">shape</span> <span class="c1"># (n_samples, n_outputs, n_predictors)</span>
+<span class="n">offsets</span><span class="o">.</span><span class="n">shape</span>  <span class="c1"># (n_samples, n_outputs)</span>
+
+<span class="c1"># Contextualized linear regression coefficients are shape:</span>
+<span class="c1"># (n_samples, n_outputs, n_predictors)</span>
+<span class="c1"># Let&#39;s squeeze out the n_outputs axis since we only have 1 output in this example.</span>
+<span class="n">coefs</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="n">coefs</span><span class="p">)</span>
+
+<span class="c1"># Any embedding method could be used; here we will use UMAP.</span>
+<span class="kn">from</span> <span class="nn">umap</span> <span class="kn">import</span> <span class="n">UMAP</span>
+<span class="n">um</span> <span class="o">=</span> <span class="n">UMAP</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+<span class="n">model_reps</span> <span class="o">=</span> <span class="n">um</span><span class="o">.</span><span class="n">fit_transform</span><span class="p">(</span><span class="n">coefs</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="c1"># A simple helper function is provided in the analysis toolkit for plotting embeddings.</span>
+<span class="kn">from</span> <span class="nn">contextualized.analysis.embeddings</span> <span class="kn">import</span> <span class="n">plot_embedding_for_all_covars</span>
+<span class="n">plot_embedding_for_all_covars</span><span class="p">(</span><span class="n">model_reps</span><span class="p">,</span> <span class="n">C</span><span class="p">,</span> <span class="n">xlabel</span><span class="o">=</span><span class="s1">&#39;Model UMAP 1&#39;</span><span class="p">,</span> <span class="n">ylabel</span><span class="o">=</span><span class="s1">&#39;Model UMAP 2&#39;</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<img alt="_images/d6a07dbeeb8d7de13d864c46c3e345e87a65be811fc2f9fab07f9b688442eefa.png" src="_images/d6a07dbeeb8d7de13d864c46c3e345e87a65be811fc2f9fab07f9b688442eefa.png" />
+<img alt="_images/1a5c40e3d653dc8972a9ee0d18752f81b25118f187ab678acc0d54a4b6cd8172.png" src="_images/1a5c40e3d653dc8972a9ee0d18752f81b25118f187ab678acc0d54a4b6cd8172.png" />
+<img alt="_images/2b73584e61d8c7aeb69650910e2d58c44218d37211a744483f6f9d0fe9e23d9b.png" src="_images/2b73584e61d8c7aeb69650910e2d58c44218d37211a744483f6f9d0fe9e23d9b.png" />
+</div>
+</div>
+</section>
+<section id="homogeneous-vs-heterogeneous-effects">
+<h2>Homogeneous vs. Heterogeneous Effects<a class="headerlink" href="#homogeneous-vs-heterogeneous-effects" title="Permalink to this heading">#</a></h2>
+<p>Now let’s really dig in and try to tease apart homogeneous (context-invariant) and heterogeneous (context-dependent) effects.
+This is a primary goal of contextualized modeling: to understand how different predictors are affected by different contexts, and use this information to make better predictions.</p>
+<p>Before diving in, let’s first understand the structure of the model.</p>
+<section id="what-is-a-model">
+<h3>What is a Model<a class="headerlink" href="#what-is-a-model" title="Permalink to this heading">#</a></h3>
+<p>A parametric statistical model can be written as a probability distribution <span class="math notranslate nohighlight">\(P\)</span> over the data <span class="math notranslate nohighlight">\(X\)</span>, defined by some parameters <span class="math notranslate nohighlight">\(\theta\)</span>.</p>
+<div class="math notranslate nohighlight">
+\[P(X | \theta)\]</div>
+<p>For example, a linear regression model is</p>
+<div class="math notranslate nohighlight">
+\[P(Y | X, \theta) = \mathcal{N}(Y | X\beta + \mu, \sigma^2) \propto \exp(\frac{1}{2\sigma^2}(Y - X\beta - \mu)^2)\]</div>
+<p>where <span class="math notranslate nohighlight">\(\beta\)</span> are the regression coefficients, <span class="math notranslate nohighlight">\(\mu\)</span> is the offset of the model, <span class="math notranslate nohighlight">\(X\beta + \mu\)</span> is the <span class="math notranslate nohighlight">\(X\)</span>-conditioned mean of <span class="math notranslate nohighlight">\(Y\)</span>, and <span class="math notranslate nohighlight">\(\sigma^2\)</span> is the variance/error around the mean Y.</p>
+</section>
+<section id="what-is-a-contextualized-model">
+<h3>What is a Contextualized Model<a class="headerlink" href="#what-is-a-contextualized-model" title="Permalink to this heading">#</a></h3>
+<p>In a contextualized model, the parameters <span class="math notranslate nohighlight">\(\theta\)</span> are themselves functions of some context <span class="math notranslate nohighlight">\(C\)</span>.</p>
+<div class="math notranslate nohighlight">
+\[P(X | \theta(C))\]</div>
+<p>For linear regression, this becomes</p>
+<div class="math notranslate nohighlight">
+\[P(Y | X, \theta(C)) = \mathcal{N}(Y | X\beta(C) + \mu(C), \sigma^2)\]</div>
+<p>Now, the regression coefficients <span class="math notranslate nohighlight">\(\beta(C)\)</span> and the offset <span class="math notranslate nohighlight">\(\mu(C)\)</span> are functions of the context <span class="math notranslate nohighlight">\(C\)</span>.
+But not all parameters will depend on context; some may not change.
+Let’s call the regression coefficients which depend on context <span class="math notranslate nohighlight">\(\beta(C)\)</span> and the ones which don’t <span class="math notranslate nohighlight">\(\beta\)</span>.</p>
+<div class="math notranslate nohighlight">
+\[P(Y | X, \theta(C)) = \mathcal{N}(Y | X\beta + X\beta(C) + \mu(C), \sigma^2)\]</div>
+<p>Assuming the data is already normalized we don’t need to split <span class="math notranslate nohighlight">\(\mu(C)\)</span>.
+Notice that there are three types of effects in contextualized models:</p>
+<ul class="simple">
+<li><p>Homogeneous Context Effects <span class="math notranslate nohighlight">\(\mu(C)\)</span>: Effects directly from context which do not depend on predictors.</p></li>
+<li><p>Homogeneous Predictor Effects <span class="math notranslate nohighlight">\(\beta\)</span>: Effects from predictors which do not depend on context.</p></li>
+<li><p>Heterogeneous Predictor Effects <span class="math notranslate nohighlight">\(\beta(C)\)</span>: Effects from predictors which are modulated by context.</p></li>
+</ul>
+</section>
+<section id="testing-for-homogeneous-and-heterogeneous-effects">
+<h3>Testing for Homogeneous and Heterogeneous Effects<a class="headerlink" href="#testing-for-homogeneous-and-heterogeneous-effects" title="Permalink to this heading">#</a></h3>
+<p>Now that these effects are specified, we can identify and visualize them based on a parameter’s context-dependence or context-independence, or as a direct contextual effect.
+Furthermore, we can test them and quanitfy certainty in the effect based on the estimates from each of the bootstrap runs.</p>
+</section>
+</section>
+<section id="plotting-homogeneous-and-heterogeneous-effects">
+<h2>Plotting Homogeneous and Heterogeneous Effects<a class="headerlink" href="#plotting-homogeneous-and-heterogeneous-effects" title="Permalink to this heading">#</a></h2>
+<p>Helper analysis tools are provided to analyze each of these effects by:</p>
+<ul class="simple">
+<li><p>getting the values of the effects for a domain of context</p></li>
+<li><p>plotting the values of the effect for a domain of context</p></li>
+<li><p>calculating p-values of the effect for a domain of context</p></li>
+</ul>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">contextualized.analysis.effects</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">plot_homogeneous_context_effects</span><span class="p">,</span>
+    <span class="n">plot_homogeneous_predictor_effects</span><span class="p">,</span>
+    <span class="n">plot_heterogeneous_predictor_effects</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="kn">from</span> <span class="nn">contextualized.analysis.pvals</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">calc_homogeneous_context_effects_pvals</span><span class="p">,</span>
+    <span class="n">calc_homogeneous_predictor_effects_pvals</span><span class="p">,</span>
+    <span class="n">calc_heterogeneous_predictor_effects_pvals</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</div>
+</div>
+</section>
+<section id="homogeneous-context-effects-of-diabetes-progression">
+<h2>Homogeneous Context Effects of Diabetes Progression<a class="headerlink" href="#homogeneous-context-effects-of-diabetes-progression" title="Permalink to this heading">#</a></h2>
+<p>First, we can see the homogeneous (direct) effects of context on diabetes progression.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="n">plot_homogeneous_context_effects</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span> <span class="n">C_test</span><span class="p">,</span> <span class="n">classification</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">ylabel</span><span class="o">=</span><span class="s2">&quot;Diabetes Progression&quot;</span><span class="p">,</span> <span class="n">verbose</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<div class="output stderr highlight-myst-ansi notranslate"><div class="highlight"><pre><span></span>/opt/homebrew/Caskroom/miniforge/base/envs/contextualized310dev/lib/python3.10/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:441: The &#39;predict_dataloader&#39; does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=7` in the `DataLoader` to improve performance.
+</pre></div>
+</div>
+<img alt="_images/189e09597b216e13afcf4b965f5bb6cffb8f58a5deb3d249f556225f4da44e23.png" src="_images/189e09597b216e13afcf4b965f5bb6cffb8f58a5deb3d249f556225f4da44e23.png" />
+<img alt="_images/1dcedf8c105b3804149fddb407013463dcd9be176de713fe7b30790553eadc8e.png" src="_images/1dcedf8c105b3804149fddb407013463dcd9be176de713fe7b30790553eadc8e.png" />
+<img alt="_images/4203cf7b033f43b5dddc1ae8e5bbfb52cf044e9a4037eb28b0e8509fee33aac5.png" src="_images/4203cf7b033f43b5dddc1ae8e5bbfb52cf044e9a4037eb28b0e8509fee33aac5.png" />
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="o">%%capture</span>
+<span class="c1"># We can quantify the uncertainty visualized in the bootstrap confidence intervals</span>
+<span class="c1"># by measuring p-values of the consistency of the estimated sign of each effect.</span>
+<span class="n">homogeneous_context_pvals</span> <span class="o">=</span> <span class="n">calc_homogeneous_context_effects_pvals</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">C_test</span><span class="p">)</span>
+<span class="n">context_pvals</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span>
+   <span class="p">[</span><span class="n">C_test</span><span class="o">.</span><span class="n">columns</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">pval</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">pval</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">homogeneous_context_pvals</span><span class="p">)</span>
+<span class="p">]),</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;Context Variable&quot;</span><span class="p">,</span> <span class="s2">&quot;p-value&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="n">context_pvals</span>
+<span class="c1"># Notice that the p-values are calculated from bootstrap resampling,</span>
+<span class="c1"># so they are limited by the number of bootstraps used.</span>
+<span class="c1"># Caution: using more bootstraps could artificially inflate confidence.</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<div class="output text_html"><div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type {
+        vertical-align: middle;
+    }
+
+    .dataframe tbody tr th {
+        vertical-align: top;
+    }
+
+    .dataframe thead th {
+        text-align: right;
+    }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>Context Variable</th>
+      <th>p-value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>age</td>
+      <td>0.3333333333333333</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>sex</td>
+      <td>0.047619047619047616</td>
+    </tr>
+    <tr>
+      <th>2</th>
+      <td>bmi</td>
+      <td>0.047619047619047616</td>
+    </tr>
+  </tbody>
+</table>
+</div></div></div>
+</div>
+</section>
+<section id="homogeneous-predictor-effects-on-diabetes-progression">
+<h2>Homogeneous Predictor Effects on Diabetes Progression<a class="headerlink" href="#homogeneous-predictor-effects-on-diabetes-progression" title="Permalink to this heading">#</a></h2>
+<p>Next, we can see the homogeneous effects of the predictors on progression.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="n">plot_homogeneous_predictor_effects</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span> <span class="n">C_test</span><span class="p">,</span> <span class="n">X_test</span><span class="p">,</span>
+    <span class="n">ylabel</span><span class="o">=</span><span class="s2">&quot;Diabetes Progression&quot;</span><span class="p">,</span>
+    <span class="n">classification</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<div class="output stderr highlight-myst-ansi notranslate"><div class="highlight"><pre><span></span>/opt/homebrew/Caskroom/miniforge/base/envs/contextualized310dev/lib/python3.10/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:441: The &#39;predict_dataloader&#39; does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=7` in the `DataLoader` to improve performance.
+</pre></div>
+</div>
+<img alt="_images/6a6693d5ad95f46e2ed75a3de739ca0f7b3f7dd0e9b62896a0fcbf017ba7ebd8.png" src="_images/6a6693d5ad95f46e2ed75a3de739ca0f7b3f7dd0e9b62896a0fcbf017ba7ebd8.png" />
+<img alt="_images/aff7c69333a9310cb999cb7426524e7d650c6eb3f41d7719c111991700e7acd4.png" src="_images/aff7c69333a9310cb999cb7426524e7d650c6eb3f41d7719c111991700e7acd4.png" />
+<img alt="_images/b53c33d2abe8b2c688844c6a7bbd9e2b01fff904deddc3c20f2f8c3d5062cf6b.png" src="_images/b53c33d2abe8b2c688844c6a7bbd9e2b01fff904deddc3c20f2f8c3d5062cf6b.png" />
+<img alt="_images/d112da21cd6ce36738c988fd440f5499ce1733157d65fd2c28de8869391e5caa.png" src="_images/d112da21cd6ce36738c988fd440f5499ce1733157d65fd2c28de8869391e5caa.png" />
+<img alt="_images/473381cc9b8318b9d1fbbef283b24bbd91f98a5d568a502062b176f95ff47ece.png" src="_images/473381cc9b8318b9d1fbbef283b24bbd91f98a5d568a502062b176f95ff47ece.png" />
+<img alt="_images/ac17fb1f67cde51fa7269c3d85e70cd6236b4646e9e9730a4a7b6c79042ffb30.png" src="_images/ac17fb1f67cde51fa7269c3d85e70cd6236b4646e9e9730a4a7b6c79042ffb30.png" />
+<img alt="_images/bfac7062f5313f5653ae949e828d8031fff38484d5dcb1b64f3329e578eb31af.png" src="_images/bfac7062f5313f5653ae949e828d8031fff38484d5dcb1b64f3329e578eb31af.png" />
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="o">%%capture</span>
+<span class="c1"># We can quantify the uncertainty visualized in the bootstrap confidence intervals</span>
+<span class="c1"># by measuring p-values of the consistency of the estimated sign of each effect.</span>
+<span class="n">homogeneous_predictor_pvals</span> <span class="o">=</span> <span class="n">calc_homogeneous_predictor_effects_pvals</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">C_test</span><span class="p">)</span>
+<span class="n">predictor_pvals</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span>
+   <span class="p">[</span><span class="n">X_test</span><span class="o">.</span><span class="n">columns</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">pval</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">pval</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">homogeneous_predictor_pvals</span><span class="p">)</span>
+<span class="p">]),</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;Predictor&quot;</span><span class="p">,</span> <span class="s2">&quot;p-value&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="n">predictor_pvals</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<div class="output text_html"><div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type {
+        vertical-align: middle;
+    }
+
+    .dataframe tbody tr th {
+        vertical-align: top;
+    }
+
+    .dataframe thead th {
+        text-align: right;
+    }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>Predictor</th>
+      <th>p-value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>bp</td>
+      <td>0.047619047619047616</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>s1</td>
+      <td>0.14285714285714285</td>
+    </tr>
+    <tr>
+      <th>2</th>
+      <td>s2</td>
+      <td>0.42857142857142855</td>
+    </tr>
+    <tr>
+      <th>3</th>
+      <td>s3</td>
+      <td>0.047619047619047616</td>
+    </tr>
+    <tr>
+      <th>4</th>
+      <td>s4</td>
+      <td>0.47619047619047616</td>
+    </tr>
+    <tr>
+      <th>5</th>
+      <td>s5</td>
+      <td>0.047619047619047616</td>
+    </tr>
+    <tr>
+      <th>6</th>
+      <td>s6</td>
+      <td>0.19047619047619047</td>
+    </tr>
+  </tbody>
+</table>
+</div></div></div>
+</div>
+</section>
+<section id="heterogeneous-predictor-effects-on-diabetes-progression">
+<h2>Heterogeneous Predictor Effects on Diabetes Progression<a class="headerlink" href="#heterogeneous-predictor-effects-on-diabetes-progression" title="Permalink to this heading">#</a></h2>
+<p>Finally, we can see the heterogeneous effects of the predictors on progression.</p>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="n">plot_heterogeneous_predictor_effects</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">C_test</span><span class="p">,</span> <span class="n">X_test</span><span class="p">,</span> <span class="n">min_effect_size</span><span class="o">=</span><span class="mf">0.1</span><span class="p">,</span>
+                  <span class="n">ylabel</span><span class="o">=</span><span class="s2">&quot;Influence of&quot;</span><span class="p">)</span>
+<span class="c1"># Since there are a combinatorial number of heterogeneous predictor effects,</span>
+<span class="c1"># min_effect_size is a useful parameter to restrict the plotting to</span>
+<span class="c1"># only the strongest effects.</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<div class="output stream highlight-myst-ansi notranslate"><div class="highlight"><pre><span></span>Generating datapoints for visualization by assuming the encoder is
+            an additive model and thus doesn&#39;t require sampling on a manifold.
+            If the encoder has interactions, please supply C_vis so that we
+            can visualize these effects on the correct data manifold.
+</pre></div>
+</div>
+<img alt="_images/35ae3aa1731a6dfe690060b3eea48fd2229eb5d1639f31d708bd8d64a3a667e3.png" src="_images/35ae3aa1731a6dfe690060b3eea48fd2229eb5d1639f31d708bd8d64a3a667e3.png" />
+<img alt="_images/6f27aae71229ccdfaf9edcc3b9a4baf6e7b04f78df0a1ce74a47eafa00d13805.png" src="_images/6f27aae71229ccdfaf9edcc3b9a4baf6e7b04f78df0a1ce74a47eafa00d13805.png" />
+<img alt="_images/0a231c75233968bccb82baaee7b4e0d9ed266faa10f7d904296b3f1146aa06bb.png" src="_images/0a231c75233968bccb82baaee7b4e0d9ed266faa10f7d904296b3f1146aa06bb.png" />
+<img alt="_images/842eea125c4e0853f2f41885530098af11e1f0ba9a471e6c80828b9b4e2d2ab3.png" src="_images/842eea125c4e0853f2f41885530098af11e1f0ba9a471e6c80828b9b4e2d2ab3.png" />
+<img alt="_images/1b31e9137fa874c37749d1593d1c23b51ec00428e6051a2cfe7b33cf8025a09e.png" src="_images/1b31e9137fa874c37749d1593d1c23b51ec00428e6051a2cfe7b33cf8025a09e.png" />
+<img alt="_images/63b769f7e262a9c0acf8ef73f01d83132e9b86a30c512baeb02b33cf3d1f19fc.png" src="_images/63b769f7e262a9c0acf8ef73f01d83132e9b86a30c512baeb02b33cf3d1f19fc.png" />
+<img alt="_images/3a98f56af54b3670be4b0be6d450b87caf73ebfe5e52178c0513209cb0992b81.png" src="_images/3a98f56af54b3670be4b0be6d450b87caf73ebfe5e52178c0513209cb0992b81.png" />
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="o">%%capture</span>
+<span class="c1"># We can quantify the uncertainty visualized in the bootstrap confidence intervals</span>
+<span class="c1"># by measuring p-values of the consistency of the estimated sign of each effect.</span>
+<span class="c1"># This is a combinatorial: context x predictor</span>
+<span class="n">heterogeneous_predictor_pvals</span> <span class="o">=</span> <span class="n">calc_heterogeneous_predictor_effects_pvals</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">C_test</span><span class="p">)</span>
+<span class="n">predictor_pvals</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span>
+   <span class="p">[</span><span class="n">C_test</span><span class="o">.</span><span class="n">columns</span><span class="p">[</span><span class="n">i</span> <span class="o">//</span> <span class="nb">len</span><span class="p">(</span><span class="n">X</span><span class="o">.</span><span class="n">columns</span><span class="p">)],</span> <span class="n">X_test</span><span class="o">.</span><span class="n">columns</span><span class="p">[</span><span class="n">i</span> <span class="o">%</span> <span class="nb">len</span><span class="p">(</span><span class="n">X</span><span class="o">.</span><span class="n">columns</span><span class="p">)],</span> <span class="n">pval</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">pval</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">heterogeneous_predictor_pvals</span><span class="o">.</span><span class="n">flatten</span><span class="p">())</span>
+<span class="p">]),</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;Context&quot;</span><span class="p">,</span> <span class="s2">&quot;Predictor&quot;</span><span class="p">,</span> <span class="s2">&quot;p-value&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+</div>
+</div>
+<div class="cell docutils container">
+<div class="cell_input docutils container">
+<div class="highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="n">predictor_pvals</span>
+</pre></div>
+</div>
+</div>
+<div class="cell_output docutils container">
+<div class="output text_html"><div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type {
+        vertical-align: middle;
+    }
+
+    .dataframe tbody tr th {
+        vertical-align: top;
+    }
+
+    .dataframe thead th {
+        text-align: right;
+    }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>Context</th>
+      <th>Predictor</th>
+      <th>p-value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>age</td>
+      <td>bp</td>
+      <td>0.5238095238095238</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>age</td>
+      <td>s1</td>
+      <td>0.42857142857142855</td>
+    </tr>
+    <tr>
+      <th>2</th>
+      <td>age</td>
+      <td>s2</td>
+      <td>0.38095238095238093</td>
+    </tr>
+    <tr>
+      <th>3</th>
+      <td>age</td>
+      <td>s3</td>
+      <td>0.3333333333333333</td>
+    </tr>
+    <tr>
+      <th>4</th>
+      <td>age</td>
+      <td>s4</td>
+      <td>0.5714285714285714</td>
+    </tr>
+    <tr>
+      <th>5</th>
+      <td>age</td>
+      <td>s5</td>
+      <td>0.42857142857142855</td>
+    </tr>
+    <tr>
+      <th>6</th>
+      <td>age</td>
+      <td>s6</td>
+      <td>0.3333333333333333</td>
+    </tr>
+    <tr>
+      <th>7</th>
+      <td>sex</td>
+      <td>bp</td>
+      <td>0.19047619047619047</td>
+    </tr>
+    <tr>
+      <th>8</th>
+      <td>sex</td>
+      <td>s1</td>
+      <td>0.14285714285714285</td>
+    </tr>
+    <tr>
+      <th>9</th>
+      <td>sex</td>
+      <td>s2</td>
+      <td>0.2857142857142857</td>
+    </tr>
+    <tr>
+      <th>10</th>
+      <td>sex</td>
+      <td>s3</td>
+      <td>0.19047619047619047</td>
+    </tr>
+    <tr>
+      <th>11</th>
+      <td>sex</td>
+      <td>s4</td>
+      <td>0.38095238095238093</td>
+    </tr>
+    <tr>
+      <th>12</th>
+      <td>sex</td>
+      <td>s5</td>
+      <td>0.19047619047619047</td>
+    </tr>
+    <tr>
+      <th>13</th>
+      <td>sex</td>
+      <td>s6</td>
+      <td>0.38095238095238093</td>
+    </tr>
+    <tr>
+      <th>14</th>
+      <td>bmi</td>
+      <td>bp</td>
+      <td>0.047619047619047616</td>
+    </tr>
+    <tr>
+      <th>15</th>
+      <td>bmi</td>
+      <td>s1</td>
+      <td>0.09523809523809523</td>
+    </tr>
+    <tr>
+      <th>16</th>
+      <td>bmi</td>
+      <td>s2</td>
+      <td>0.38095238095238093</td>
+    </tr>
+    <tr>
+      <th>17</th>
+      <td>bmi</td>
+      <td>s3</td>
+      <td>0.2857142857142857</td>
+    </tr>
+    <tr>
+      <th>18</th>
+      <td>bmi</td>
+      <td>s4</td>
+      <td>0.42857142857142855</td>
+    </tr>
+    <tr>
+      <th>19</th>
+      <td>bmi</td>
+      <td>s5</td>
+      <td>0.42857142857142855</td>
+    </tr>
+    <tr>
+      <th>20</th>
+      <td>bmi</td>
+      <td>s6</td>
+      <td>0.23809523809523808</td>
+    </tr>
+  </tbody>
+</table>
+</div></div></div>
+</div>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Permalink to this heading">#</a></h2>
+<p>Notice that only bmi appears to contribute to heterogeneity in diabetes progression through bp and s1 (we can increase bootstraps to confirm whether these are significant. 20 bootstraps is the minimum threshold for a P-value &lt;0.05 without correcting for multiple testing).</p>
+<p>Key takeaways:</p>
+<ol class="arabic simple">
+<li><p>BMI modulates the effect of blood pressure and the s1 on diabetes progression. BMI should be controlled for in studies on diabetes, and stratifying groups by BMI may be useful for identifying personalized treatments.</p></li>
+<li><p>Other predictors show context invariance, or are direct effects of context. These predictors can be used to predict diabetes progression in a general population.</p></li>
+<li><p>Contextualization enables us to split these effects without performing many pairwise tests between predictor and context features. All of this was achieved from a single training run, and can be validated by model accuracy.</p></li>
+</ol>
+</section>
+</section>
+
+    <script type="text/x-thebe-config">
+    {
+        requestKernel: true,
+        binderOptions: {
+            repo: "binder-examples/jupyter-stacks-datascience",
+            ref: "master",
+        },
+        codeMirrorConfig: {
+            theme: "abcdef",
+            mode: "python"
+        },
+        kernelOptions: {
+            name: "python3",
+            path: "./."
+        },
+        predefinedOutput: true
+    }
+    </script>
+    <script>kernelName = 'python3'</script>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="model-fitting.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Fitting Contextualized Models</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="under-the-hood.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Under the Hood</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+  <div class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav class="bd-toc-nav page-toc">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#load-the-trained-model">Load the trained model</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inspect-the-model-predictions">Inspect the model predictions.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#check-how-the-individual-bootstrap-models-learned">Check how the individual bootstrap models learned.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#check-what-effects-the-models-learned">Check what effects the models learned.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#homogeneous-vs-heterogeneous-effects">Homogeneous vs. Heterogeneous Effects</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-a-model">What is a Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-a-contextualized-model">What is a Contextualized Model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-for-homogeneous-and-heterogeneous-effects">Testing for Homogeneous and Heterogeneous Effects</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#plotting-homogeneous-and-heterogeneous-effects">Plotting Homogeneous and Heterogeneous Effects</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#homogeneous-context-effects-of-diabetes-progression">Homogeneous Context Effects of Diabetes Progression</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#homogeneous-predictor-effects-on-diabetes-progression">Homogeneous Predictor Effects on Diabetes Progression</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#heterogeneous-predictor-effects-on-diabetes-progression">Heterogeneous Predictor Effects on Diabetes Progression</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By Contextualized Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2023.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=8d27b9dea8ad943066ae"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=8d27b9dea8ad943066ae"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
