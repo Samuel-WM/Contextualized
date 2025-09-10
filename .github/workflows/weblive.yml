@@ -1,0 +1,44 @@
+# .github/workflows/pages.yml
+name: Deploy static site (site-src-new) to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'site-src-new/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 可选：避免被 Jekyll 处理（安全起见保留）
+      - name: Ensure .nojekyll
+        run: touch site-src-new/.nojekyll
+
+      # 把 site-src-new 当作站点根目录上传
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site-src-new
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
