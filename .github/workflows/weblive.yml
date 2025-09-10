@@ -11,7 +11,7 @@ on:
       - 'make_docs.sh'             # Rebuild if the docs build script changes
       - 'pyproject.toml'
       - 'dev_requirements.txt'
-      - '.github/workflows/pages.yml'
+      - '.github/workflows/*.yml'
   workflow_dispatch:               # Allow manual trigger from Actions tab
 
 permissions:
