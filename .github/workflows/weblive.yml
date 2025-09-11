@@ -1,11 +1,11 @@
 # .github/workflows/pages.yml
-name: Build & Deploy site-src-new (homepage) + docs (Sphinx) to GitHub Pages
+name: Build & Deploy index-src (homepage) + docs (Sphinx) to GitHub Pages
 
 on:
   push:
     branches: [ main ]
     paths:
-      - 'site-src-new/**'          # Rebuild if homepage files change
+      - 'website/index-src/**'          # Rebuild if homepage files change
       - 'contextualized/**'        # Rebuild if source code changes (docstrings)
       - 'docs/**'                  # Rebuild if docs source changes
       - 'make_docs.sh'             # Rebuild if the docs build script changes
@@ -61,13 +61,13 @@ jobs:
           bash make_docs.sh
 
       # Step 5: Assemble final site content
-      # - site-src-new/ → site root (homepage)
+      # - index-src/ → site root (homepage)
       # - docs/_build/html/ → /docs/ subpath
       - name: Assemble site for deployment
         run: |
           rm -rf out
           mkdir -p out
-          rsync -a site-src-new/ out/            # Homepage files
+          rsync -a website/index-src/ out/            # Homepage files
           rsync -a docs/_build/html/ out/docs/   # Documentation files
           touch out/.nojekyll                    # Disable Jekyll on GitHub Pages
           test -f out/CNAME && echo "CNAME found" || echo "No CNAME"
