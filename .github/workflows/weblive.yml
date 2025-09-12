@@ -1,0 +1,85 @@
+# .github/workflows/pages.yml
+name: Build & Deploy index-src (homepage) + docs (Sphinx) to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'website/index-src/**'          # Rebuild if homepage files change
+      - 'contextualized/**'        # Rebuild if source code changes (docstrings)
+      - 'docs/**'                  # Rebuild if docs source changes
+      - 'make_docs.sh'             # Rebuild if the docs build script changes
+      - 'pyproject.toml'
+      - 'dev_requirements.txt'
+      - '.github/workflows/*.yml'
+  workflow_dispatch:               # Allow manual trigger from Actions tab
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Step 1: Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Setup Python (needed for Sphinx/Jupyter-Book)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Step 3: Install dependencies (if dev_requirements.txt exists)
+      - name: Install documentation dependencies
+        run: |
+          if [ -f dev_requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r dev_requirements.txt
+          fi
+     
+      # Add: Install the package itself in editable mode so autodoc can import it
+      - name: Install package
+        run: |
+          pip install -e .
+
+      # Step 4: Build documentation using your script (make_docs.sh)
+      # This will generate HTML into docs/_build/html/
+      - name: Build docs
+        run: |
+          chmod +x make_docs.sh || true
+          bash make_docs.sh
+
+      # Step 5: Assemble final site content
+      # - index-src/ → site root (homepage)
+      # - docs/_build/html/ → /docs/ subpath
+      - name: Assemble site for deployment
+        run: |
+          rm -rf out
+          mkdir -p out
+          rsync -a website/index-src/ out/            # Homepage files
+          rsync -a docs/_build/html/ out/docs/   # Documentation files
+          touch out/.nojekyll                    # Disable Jekyll on GitHub Pages
+          test -f out/CNAME && echo "CNAME found" || echo "No CNAME"
+
+      # Step 6: Upload artifact (the prepared 'out' directory)
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+      # Step 7: Deploy to GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
