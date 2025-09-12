@@ -413,7 +413,7 @@ class SKLearnWrapper:
         arr : numpy array (possible NaN/Inf)
         axis : int, axis to average over (default=0)
         """
-        
+
         if not np.isfinite(arr).all():
             # convert infs to nans so they can be dropped
             arr = np.where(np.isfinite(arr), arr, np.nan)
@@ -425,11 +425,14 @@ class SKLearnWrapper:
                 "All bootstraps produced non-finite predictions for some items. "
             )
         return mean
-    
-    
-    def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
+
+    def predict(
+        self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
+    ):
         if not hasattr(self, "models") or self.models is None:
-            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
+            raise ValueError(
+                "Trying to predict with a model that hasn't been trained yet."
+            )
         predictions = np.array(
             [
                 self.trainers[i].predict_y(
@@ -453,19 +456,19 @@ class SKLearnWrapper:
             bad = ~np.isfinite(predictions)
             if bad.any():
                 num_bad_boots = np.unique(np.where(bad)[0]).size
-                print(f"Warning: {num_bad_boots}/{len(self.models)} bootstraps produced non-finite predictions; excluding them from the ensemble.")
+                print(
+                    f"Warning: {num_bad_boots}/{len(self.models)} bootstraps produced non-finite predictions; excluding them from the ensemble."
+                )
             preds = self._nanrobust_mean(predictions, axis=0)
 
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
                 preds = np.array(
                     [self.scalers["Y"].inverse_transform(p) for p in preds]
-                    )
+                )
             else:
                 preds = self.scalers["Y"].inverse_transform(preds)
         return preds
-    
-    
 
     def predict_params(
         self,
