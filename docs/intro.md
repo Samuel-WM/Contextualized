@@ -52,9 +52,9 @@ C_train, C_test, X_train, X_test, Y_train, Y_test = train_test_split(C, X, Y, te
 
 ### 3. Fit a model with context-specific parameters:
 ```python
-from contextualized.easy import ContextualizedRegression
+from contextualized.easy import ContextualizedRegressor
 
-model = ContextualizedClassifier()
+model = ContextualizedRegressor()
 model.fit(X_train, Y_train, C_train)
 Y_preds = model.predict(X_test, C_test)
 contextualized_params = model.predict_params(C_test)
