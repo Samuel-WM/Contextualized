@@ -95,16 +95,17 @@ Beyond code contributions, many people have helped. Check out [ACKNOWLEDGEMENTS.
 ## Related Publications and Pre-prints
 - [Contextualized Machine Learning (ArXiv '23)](https://arxiv.org/abs/2310.11340)
 - [Contextualized: Heterogeneous Modeling Toolbox (JOSS '24)](https://doi.org/10.21105/joss.06469)
-- Networks
-  - [Learning to estimate sample-specific transcriptional networks for 7,000 tumors (PNAS '25)](https://www.pnas.org/doi/10.1073/pnas.2411930122)
-  - [NOTMAD: Estimating Bayesian Networks with Sample-Specific Structures and Parameters (ArXiv '23)](http://arxiv.org/abs/2111.01104)
-- Applications
+- Contextualized Regression and Classification
   - [Patient-Specific Models of Treatment Effects Explain Heterogeneity in Tuberculosis (ML4H '24)](https://arxiv.org/abs/2411.10645)
-  - [Contextualized Policy Recovery: Modeling and Interpreting Medical Decisions with Adaptive Imitation Learning (ICML '24)](https://arxiv.org/abs/2310.07918)
   - [Automated Interpretable Discovery of Heterogeneous Treatment Effectiveness: A COVID-19 Case Study (JBI '22)](https://www.sciencedirect.com/science/article/pii/S1532046422001022)
   - [Discriminative Subtyping of Lung Cancers from Histopathology Images via Contextual Deep Learning (MedRxiv '22)](https://www.medrxiv.org/content/10.1101/2020.06.25.20140053v2)
   - [Personalized Survival Prediction with Contextual Explanation Networks (ML4H '17)](http://arxiv.org/abs/1801.09810)
   - [Contextual Explanation Networks (JMLR '20)](https://jmlr.org/papers/v21/18-856.html)
+- Contextualized Networks
+  - [Learning to estimate sample-specific transcriptional networks for 7,000 tumors (PNAS '25)](https://www.pnas.org/doi/10.1073/pnas.2411930122)
+  - [NOTMAD: Estimating Bayesian Networks with Sample-Specific Structures and Parameters (ArXiv '23)](http://arxiv.org/abs/2111.01104)
+- Contextualized Timeseries
+  - [Contextualized Policy Recovery: Modeling and Interpreting Medical Decisions with Adaptive Imitation Learning (ICML '24)](https://arxiv.org/abs/2310.07918)
 - Background reading:
   - [Varying-Coefficient Models (JRStatSoc)](https://academic.oup.com/jrsssb/article-abstract/55/4/757/7028270)
 
