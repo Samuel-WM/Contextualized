@@ -433,6 +433,38 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
             C, uses_y=False, project_to_dag=project_to_dag, **kwargs
         )
         return betas
+    
+    def _reconstruct_from_betas(self, betas: np.ndarray, X_arr: np.ndarray) -> np.ndarray:
+        """
+        Given betas of shape (n_samples, n_features, n_features)
+        and X_arr of shape (n_samples, n_features)
+        produce a reconstruction: X_hat[i] = betas[i] @ X_arr[i].
+        Diagonals  zeroed to avoid self edges.
+        """
+
+        n_samples, n_features = X_arr.shape
+
+        B = betas.copy()
+        idx = np.arange(n_features)
+        B[:, idx, idx] = 0.0  # remove self-edges
+        # one-shot reconstruction using parents' observed values
+        X_hat = np.einsum("bij,bi->bj", B, X_arr, optimize=True)
+        return X_hat
+
+
+    def predict(
+        self,
+        C: np.ndarray,
+        X: np.ndarray,
+        project_to_dag: bool = True,
+        **kwargs,
+    ) -> np.ndarray:
+        ...
+
+
+    
+
+
 
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
