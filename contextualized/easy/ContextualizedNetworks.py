@@ -435,21 +435,22 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         return betas
     
     def _reconstruct_from_betas(self, betas: np.ndarray, X_arr: np.ndarray) -> np.ndarray:
-        """
-        Given betas of shape (n_samples, n_features, n_features)
-        and X_arr of shape (n_samples, n_features)
-        produce a reconstruction: X_hat[i] = betas[i] @ X_arr[i].
-        Diagonals  zeroed to avoid self edges.
-        """
 
         n_samples, n_features = X_arr.shape
 
-        B = betas.copy()
+        B = np.array(betas, copy=True)
+        if B.ndim == 2:
+            B = np.broadcast_to(B[None, :, :], (n_samples, n_features, n_features)).copy()
+        elif B.ndim != 3:
+            raise ValueError(f"Expected betas 2D or 3D, got shape {B.shape}")
+
+        # zero diagonal
         idx = np.arange(n_features)
-        B[:, idx, idx] = 0.0  # remove self-edges
-        # one-shot reconstruction using parents' observed values
-        X_hat = np.einsum("bij,bi->bj", B, X_arr, optimize=True)
+        B[:, idx, idx] = 0.0
+
+        X_hat = dag_pred_np(X_arr, B)
         return X_hat
+
 
 
     def predict(
@@ -457,12 +458,40 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         C: np.ndarray,
         X: np.ndarray,
         project_to_dag: bool = True,
+        individual_preds: bool = False,
         **kwargs,
     ) -> np.ndarray:
-        ...
+        X_scaled = self._maybe_scale_X(X)
 
+        betas = self.predict_networks(
+            C, project_to_dag=project_to_dag, individual_preds=individual_preds, **kwargs
+        )
 
-    
+        # unify iterable over bootstraps
+        is_bootstrap_stack = isinstance(betas, np.ndarray) and betas.ndim == 4
+        if isinstance(betas, list) or is_bootstrap_stack:
+            if is_bootstrap_stack:
+                betas_iter = (betas[k] for k in range(betas.shape[0]))
+            else:
+                betas_iter = betas
+
+            reconstructions = [self._reconstruct_from_betas(b, X_scaled) for b in betas_iter]
+            recon_stack = np.stack(reconstructions, axis=0)  # (B, N, F)
+
+            if self.normalize and self.scalers["X"] is not None:
+                recon_stack = np.stack(
+                    [self.scalers["X"].inverse_transform(recon_stack[k]) for k in range(recon_stack.shape[0])],
+                    axis=0,
+                )
+
+            if individual_preds:
+                return recon_stack  # (B, N, F)
+            return self._nanrobust_mean(recon_stack, axis=0)  # (N, F)
+
+        reconstructed_scaled = self._reconstruct_from_betas(betas, X_scaled)
+        if self.normalize and self.scalers["X"] is not None:
+            return self.scalers["X"].inverse_transform(reconstructed_scaled)
+        return reconstructed_scaled
 
 
 
