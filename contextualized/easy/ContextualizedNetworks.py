@@ -107,7 +107,7 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
         )
 
     def predict_correlation(
-        self, C: np.ndarray, individual_preds: bool = True, squared: bool = True
+        self, C: np.ndarray, individual_preds: bool = False, squared: bool = True
     ) -> Union[np.ndarray, List[np.ndarray]]:
         """Predicts context-specific correlations between features.
 
@@ -182,7 +182,7 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
         super().__init__(ContextualizedMarkovGraph, [], [], MarkovTrainer, **kwargs)
 
     def predict_precisions(
-        self, C: np.ndarray, individual_preds: bool = True
+        self, C: np.ndarray, individual_preds: bool = False
     ) -> Union[np.ndarray, List[np.ndarray]]:
         """Predicts context-specific precision matrices.
         Can be converted to context-specific Markov networks by binarizing the networks and setting all non-zero entries to 1.
