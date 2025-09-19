@@ -437,6 +437,16 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
     def _reconstruct_from_betas(
         self, betas: np.ndarray, X_arr: np.ndarray
     ) -> np.ndarray:
+        
+        """Reconstructs features from predicted betas.
+
+        Args:
+            betas (np.ndarray): Coefficient matrices, shape (F, F) or (N, F, F).
+            X_arr (np.ndarray): Input data, shape (N, F).
+
+        Returns:
+            np.ndarray: Reconstructed data, shape (N, F).
+        """
 
         n_samples, n_features = X_arr.shape
 
@@ -463,6 +473,19 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         individual_preds: bool = False,
         **kwargs,
     ) -> np.ndarray:
+        
+        """Predicts reconstructed data from context and features.
+
+        Args:
+            C (np.ndarray): Contextual features, shape (N, K).
+            X (np.ndarray): Input data, shape (N, F).
+            project_to_dag (bool, optional): If True, enforce DAG structure. Defaults to True.
+            individual_preds (bool, optional): If True, return per-bootstrap predictions. Defaults to False.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            np.ndarray: Reconstructed predictions, shape (N, F), or (B, N, F) if individual_preds is True.
+        """
         X_scaled = self._maybe_scale_X(X)
 
         betas = self.predict_networks(
