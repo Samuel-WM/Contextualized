@@ -433,14 +433,18 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
             C, uses_y=False, project_to_dag=project_to_dag, **kwargs
         )
         return betas
-    
-    def _reconstruct_from_betas(self, betas: np.ndarray, X_arr: np.ndarray) -> np.ndarray:
+
+    def _reconstruct_from_betas(
+        self, betas: np.ndarray, X_arr: np.ndarray
+    ) -> np.ndarray:
 
         n_samples, n_features = X_arr.shape
 
         B = np.array(betas, copy=True)
         if B.ndim == 2:
-            B = np.broadcast_to(B[None, :, :], (n_samples, n_features, n_features)).copy()
+            B = np.broadcast_to(
+                B[None, :, :], (n_samples, n_features, n_features)
+            ).copy()
         elif B.ndim != 3:
             raise ValueError(f"Expected betas 2D or 3D, got shape {B.shape}")
 
@@ -450,8 +454,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
 
         X_hat = dag_pred_np(X_arr, B)
         return X_hat
-
-
 
     def predict(
         self,
@@ -464,7 +466,10 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         X_scaled = self._maybe_scale_X(X)
 
         betas = self.predict_networks(
-            C, project_to_dag=project_to_dag, individual_preds=individual_preds, **kwargs
+            C,
+            project_to_dag=project_to_dag,
+            individual_preds=individual_preds,
+            **kwargs,
         )
 
         # unify iterable over bootstraps
@@ -475,12 +480,17 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
             else:
                 betas_iter = betas
 
-            reconstructions = [self._reconstruct_from_betas(b, X_scaled) for b in betas_iter]
+            reconstructions = [
+                self._reconstruct_from_betas(b, X_scaled) for b in betas_iter
+            ]
             recon_stack = np.stack(reconstructions, axis=0)  # (B, N, F)
 
             if self.normalize and self.scalers["X"] is not None:
                 recon_stack = np.stack(
-                    [self.scalers["X"].inverse_transform(recon_stack[k]) for k in range(recon_stack.shape[0])],
+                    [
+                        self.scalers["X"].inverse_transform(recon_stack[k])
+                        for k in range(recon_stack.shape[0])
+                    ],
                     axis=0,
                 )
 
@@ -492,8 +502,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         if self.normalize and self.scalers["X"] is not None:
             return self.scalers["X"].inverse_transform(reconstructed_scaled)
         return reconstructed_scaled
-
-
 
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs

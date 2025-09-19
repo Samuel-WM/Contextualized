@@ -117,7 +117,9 @@ class TestContextualizedCorrelationNetworks(TestEasyNetworks):
         assert rho.shape == (1, self.n_samples, self.x_dim, self.x_dim)
         rho = model.predict_correlation(self.C, individual_preds=False, squared=False)
         assert rho.shape == (self.n_samples, self.x_dim, self.x_dim), rho.shape
-        rho_squared = model.predict_correlation(self.C, individual_preds= True, squared=True)
+        rho_squared = model.predict_correlation(
+            self.C, individual_preds=True, squared=True
+        )
         assert np.min(rho_squared) >= 0
         assert rho_squared.shape == (1, self.n_samples, self.x_dim, self.x_dim)
 
