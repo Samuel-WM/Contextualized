@@ -113,11 +113,11 @@ class TestContextualizedCorrelationNetworks(TestEasyNetworks):
             encoder_type="ngam", num_archetypes=16
         )
         self._quicktest(model, self.C, self.X, max_epochs=10, learning_rate=1e-3)
-        rho = model.predict_correlation(self.C, squared=False)
+        rho = model.predict_correlation(self.C, individual_preds=True, squared=False)
         assert rho.shape == (1, self.n_samples, self.x_dim, self.x_dim)
         rho = model.predict_correlation(self.C, individual_preds=False, squared=False)
         assert rho.shape == (self.n_samples, self.x_dim, self.x_dim), rho.shape
-        rho_squared = model.predict_correlation(self.C, squared=True)
+        rho_squared = model.predict_correlation(self.C, individual_preds= True, squared=True)
         assert np.min(rho_squared) >= 0
         assert rho_squared.shape == (1, self.n_samples, self.x_dim, self.x_dim)
 
