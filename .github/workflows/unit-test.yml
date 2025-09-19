@@ -1,13 +1,26 @@
-# This workflow will install Python dependencies and run tests with a variety of Python versions
-# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+# This workflow installs Python dependencies and runs tests across versions.
+# It is safe for PRs from forks (no secrets, read-only token).
 
 name: Unit test
 
-on: [push]
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: ["**"]
+
+# Minimal permissions so fork PRs get a read-only token
+permissions:
+  contents: read
+
+# Avoid duplicate runs when commits are pushed rapidly
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref || github.head_ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -15,15 +28,19 @@ jobs:
         python-version: ["3.8", "3.9", "3.10"]
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install .
-    - name: Test with unittest
-      run: |
-        python tests.py
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Test with unittest
+        run: |
+          python tests.py
