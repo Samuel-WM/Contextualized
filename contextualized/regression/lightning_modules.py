@@ -10,6 +10,9 @@ g: Link Function for contextualized generalized linear models.
 
 Implemented with PyTorch Lightning
 """
+# For distributed runs, use the ContextualizedRegressionDataModule which returns
+# map-style datasets and allows Lightning's Trainer to auto-shard with DDP.
+from .datamodules import ContextualizedRegressionDataModule  # noqa: F401
 
 from abc import abstractmethod
 import numpy as np

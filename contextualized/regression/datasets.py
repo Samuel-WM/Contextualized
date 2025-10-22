@@ -62,9 +62,10 @@ class MultitaskMultivariateDataset(Dataset):
     Multi-task Multivariate Dataset.
     """
     def __init__(self, C, X, Y, dtype=torch.float):
-        self.C = torch.tensor(C, dtype=dtype)
-        self.X = torch.tensor(X, dtype=dtype)
-        self.Y = torch.tensor(Y, dtype=dtype)
+        self.C = C.to(dtype) if isinstance(C, torch.Tensor) else torch.as_tensor(C, dtype=dtype)
+        self.X = X.to(dtype) if isinstance(X, torch.Tensor) else torch.as_tensor(X, dtype=dtype)
+        self.Y = Y.to(dtype) if isinstance(Y, torch.Tensor) else torch.as_tensor(Y, dtype=dtype)
+
         self.c_dim = C.shape[-1]
         self.x_dim = X.shape[-1]
         self.y_dim = Y.shape[-1]
