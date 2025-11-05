@@ -22,7 +22,15 @@ class ContextualizedClassifier(ContextualizedRegressor):
 
     def predict(self, C, X, individual_preds=False, **kwargs):
         """Predict binary outcomes from context C and predictors X."""
-        return np.round(super().predict(C, X, individual_preds, **kwargs))
+        out = super().predict(C, X, individual_preds, **kwargs)
+        out = np.asarray(out)
+        if not individual_preds:
+            if out.ndim == 3 and out.shape[-1] == 1:
+                out = out[..., 0]
+            return np.round(out)
+        # individual_preds=True: list/array per-bootstrap -> squeeze each
+        return [np.round(p[..., 0] if (p.ndim == 3 and p.shape[-1] == 1) else p) for p in out]
+
 
     def predict_proba(self, C, X, **kwargs):
         """
@@ -33,4 +41,10 @@ class ContextualizedClassifier(ContextualizedRegressor):
         np.ndarray of shape (n_samples, y_dim, 2)
         """
         probs = super().predict(C, X, **kwargs)  # (n, y_dim[, 1])
-        return np.array([1 - probs, probs]).T.swapaxes(0, 1)
+        probs = np.asarray(probs)
+        if probs.ndim == 3 and probs.shape[-1] == 1:
+            probs = probs[..., 0]
+        p1 = probs
+        p0 = 1.0 - p1
+        return np.stack([p0, p1], axis=-1)
+

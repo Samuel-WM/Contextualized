@@ -77,7 +77,10 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
                      Tuple[IndexLike, IndexLike, IndexLike]]
         ] = None,
         # dataloader config
-        batch_size: int = 32,
+        train_batch_size: int = 32,
+        val_batch_size: int = 32,
+        test_batch_size: int = 32,
+        predict_batch_size: int = 32,
         num_workers: int = 0,
         pin_memory: bool = True,
         persistent_workers: bool = False,
@@ -85,6 +88,7 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         shuffle_train: bool = True,
         shuffle_eval: bool = False,
         dtype: torch.dtype = torch.float,
+
     ):
         super().__init__()
         if task_type not in TASK_TO_DATASET:
@@ -107,7 +111,10 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         self.splitter = splitter
 
         # dl config
-        self.batch_size = batch_size
+        self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
+        self.test_batch_size = test_batch_size
+        self.predict_batch_size = predict_batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = bool(persistent_workers and num_workers > 0)
@@ -115,6 +122,7 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         self.shuffle_train = shuffle_train
         self.shuffle_eval = shuffle_eval
         self.dtype = dtype
+
 
         # will be set in setup()
         self.C: Optional[torch.Tensor] = None
@@ -178,22 +186,23 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         self.C, self.X, self.Y = C, X, Y
 
     # ---- Dataloaders ----
-    def _common_dl_kwargs(self) -> Dict:
+    def _common_dl_kwargs(self, batch_size: int) -> Dict:
         return {
-            "batch_size": self.batch_size,
+            "batch_size": batch_size,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
             "persistent_workers": self.persistent_workers,
             "drop_last": self.drop_last,
         }
 
+
     def train_dataloader(self) -> DataLoader:
         if self.ds_train is None:
             raise RuntimeError("train dataset is not set; provide train_idx or splitter.")
         return DataLoader(
             dataset=self.ds_train,
-            shuffle=self.shuffle_train,  # True only for train
-            **self._common_dl_kwargs(),
+            shuffle=self.shuffle_train,
+            **self._common_dl_kwargs(self.train_batch_size),
         )
 
     def val_dataloader(self):
@@ -202,25 +211,24 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset=self.ds_val,
             shuffle=self.shuffle_eval,
-            **self._common_dl_kwargs(),
+            **self._common_dl_kwargs(self.val_batch_size),
         )
-
 
     def test_dataloader(self) -> DataLoader:
         if self.ds_test is None:
             raise RuntimeError("test dataset is not set; provide test_idx or splitter.")
         return DataLoader(
             dataset=self.ds_test,
-            shuffle=self.shuffle_eval,   # False by default
-            **self._common_dl_kwargs(),
+            shuffle=self.shuffle_eval,
+            **self._common_dl_kwargs(self.test_batch_size),
         )
 
     def predict_dataloader(self) -> DataLoader:
         if self.ds_predict is None:
             raise RuntimeError("predict dataset is not set; provide predict_idx/test_idx.")
-        # IMPORTANT: keep shuffle=False for stable ordering per-rank
         return DataLoader(
             dataset=self.ds_predict,
             shuffle=False,
-            **self._common_dl_kwargs(),
+            **self._common_dl_kwargs(self.predict_batch_size),
         )
+

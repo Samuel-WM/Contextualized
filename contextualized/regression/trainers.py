@@ -72,27 +72,25 @@ class RegressionTrainer(pl.Trainer):
             if not torch.is_tensor(betas): betas = torch.as_tensor(betas)
             if not torch.is_tensor(mus):   mus = torch.as_tensor(mus)
 
-            # --- FIX: make shapes broadcastable ---
-                        # --- FIX: make shapes broadcastable for both multivariate (3D) and univariate (4D) ---
+            # --- shape fixes for multivariate (3D) and univariate (4D) ---
             # Multivariate convention: X (B, y, x), betas (B, y, x), mus (B, y, 1)
             # Univariate convention:   X (B, y, x, 1), betas (B, y, x, 1), mus (B, y, x, 1)
+
+            # If X is (B, x) and betas is (B, y, x), expand X -> (B, 1, x)
             if X.dim() == 2 and betas.dim() == 3 and betas.size(-1) == X.size(-1):
-                # allow X provided as (B, x) for multivariate -> expand to (B,1,x)
-                X = X.unsqueeze(1)                                    # (B,1,x)
+                X = X.unsqueeze(1)
 
-            if betas.dim() == 3 and X.dim() == 4:
-                # univariate predict_step may have squeezed betas -> add singleton to match (B,y,x,1)
-                betas = betas.unsqueeze(-1)                           # (B,y,x,1)
+            # If betas is (B, y, x) but X is (B, y, x, 1), add trailing singleton to betas
+            if betas.dim() == 3 and X.dim() == 4 and betas.size(-1) == X.size(-2):
+                betas = betas.unsqueeze(-1)
 
-            if mus.dim() == 2:
-                # multivariate: ensure (B,y,1)
-                mus = mus.unsqueeze(-1)                               # (B,y,1)
+            # Ensure mus trailing dim is singleton
+            if mus.dim() == 2:               # (B, y)
+                mus = mus.unsqueeze(-1)      # (B, y, 1)
             elif mus.dim() == 3 and X.dim() == 4 and mus.size(-1) != 1:
-                # univariate: ensure trailing singleton (B,y,x,1) if it was (B,y,x)
-                mus = mus.unsqueeze(-1)
-            # --- end FIX ---
+                mus = mus.unsqueeze(-1)      # (B, y, x, 1)
+            # --- end shape fixes ---
 
-            # --- end FIX ---
 
             yhat = model._predict_y(C, X, betas, mus)  # uses model's link
             y_parts.append(yhat.detach().cpu())
@@ -163,6 +161,8 @@ class MarkovTrainer(CorrelationTrainer):
 from contextualized.utils.engine import pick_engine
 
 
+from pytorch_lightning.strategies import DDPStrategy, Strategy as PLStrategy
+
 def make_trainer_with_env(trainer_cls=RegressionTrainer, **kwargs) -> pl.Trainer:
     # Respect explicit user settings; otherwise auto-pick
     accelerator = kwargs.pop("accelerator", None)
@@ -170,30 +170,41 @@ def make_trainer_with_env(trainer_cls=RegressionTrainer, **kwargs) -> pl.Trainer
     strategy    = kwargs.pop("strategy", None)
     plugins     = kwargs.pop("plugins", None)
 
-    accelerator, devices, strategy = pick_engine(
+    # If caller provided a concrete Strategy instance, pass it through verbatim
+    if isinstance(strategy, PLStrategy):
+        return trainer_cls(
+            accelerator=("cpu" if accelerator is None else accelerator),
+            devices=(1 if devices is None else devices),
+            strategy=strategy,
+            plugins=plugins,
+            **kwargs,
+        )
+
+    # Otherwise, select engines automatically
+    accelerator, devices, strategy_name = pick_engine(
         accelerator=accelerator,
         devices=devices,
-        strategy=strategy,
-        prefer_spawn=True,   # allows plain `python script.py` to use all GPUs
+        strategy=strategy,    # may be "ddp" or "auto"
+        prefer_spawn=True,    # allows plain `python script.py` to use all GPUs
     )
 
-    # If using classic ddp, upgrade string->Strategy with tuned flags
-    if strategy == "ddp":
-        strategy = DDPStrategy(
+    # Upgrade "ddp" string to tuned DDPStrategy
+    if strategy_name == "ddp":
+        strategy_obj = DDPStrategy(
             find_unused_parameters=False,
             static_graph=True,
             gradient_as_bucket_view=True,
         )
+    else:
+        strategy_obj = strategy_name  # "auto" or other strings
 
     if plugins is None and accelerator == "cpu":
-        from pytorch_lightning.plugins.environments import LightningEnvironment
         plugins = [LightningEnvironment()]
 
     return trainer_cls(
         accelerator=accelerator,
         devices=devices,
-        strategy=strategy,
+        strategy=strategy_obj,
         plugins=plugins,
         **kwargs,
     )
-

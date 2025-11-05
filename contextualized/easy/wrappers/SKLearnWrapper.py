@@ -31,10 +31,17 @@ DEFAULT_NORMALIZE = False
 
 class SKLearnWrapper:
     """
-    An sklearn-like wrapper for Contextualized models, optimized for multi-GPU (DDP) scaling.
+    An sklearn-like wrapper for Contextualized models.
+
+    Args:
+        base_constructor (class): Base LightningModule constructor.
+        extra_model_kwargs (Iterable[str]): Extra model kwargs to accept.
+        extra_data_kwargs (Iterable[str]): Extra data kwargs to accept.
+        trainer_constructor (class): Trainer class (usually RegressionTrainer).
+        normalize (bool): If True, standardize C/X (and Y if continuous).
     """
 
-    # ---------- defaults ----------
+    # -------------------- defaults --------------------
     def _set_defaults(self):
         self.default_learning_rate = DEFAULT_LEARNING_RATE
         self.default_n_bootstraps = DEFAULT_N_BOOTSTRAPS
@@ -72,14 +79,16 @@ class SKLearnWrapper:
         self.y_dim = None
         self.accelerator = "gpu" if torch.cuda.is_available() else "cpu"
 
-        # Acceptable kwargs routing
+        # Accepted kwarg routes
         self.acceptable_kwargs = {
             "data": [
                 "train_batch_size",
                 "val_batch_size",
                 "test_batch_size",
+                "predict_batch_size",
                 "C_val",
                 "X_val",
+                "Y_val",
                 "val_split",
                 "num_workers",
                 "pin_memory",
@@ -117,7 +126,7 @@ class SKLearnWrapper:
                 "num_sanity_val_steps",
                 "default_root_dir",
                 "log_every_n_steps",
-                "precision",  # allow explicit precision override if desired
+                "precision",
                 "enable_progress_bar",
                 "limit_val_batches",
             ],
@@ -141,6 +150,7 @@ class SKLearnWrapper:
             "data", kwargs.pop("remove_data_kwargs", []), acceptable=False
         )
 
+        # Convenience aliases handled at construction
         self.convenience_kwargs = [
             "alpha",
             "l1_ratio",
@@ -151,7 +161,7 @@ class SKLearnWrapper:
             "encoder_link_fn",
         ]
 
-        # Model constructor kwargs
+        # Model constructor kwargs (with convenience mapping)
         self.constructor_kwargs = self._organize_constructor_kwargs(**kwargs)
         self.constructor_kwargs["encoder_kwargs"]["width"] = kwargs.pop(
             "width", self.constructor_kwargs["encoder_kwargs"]["width"]
@@ -165,6 +175,8 @@ class SKLearnWrapper:
                 "link_fn", self.default_encoder_link_fn
             ),
         )
+
+        # Everything else
         self.not_constructor_kwargs = {
             k: v
             for k, v in kwargs.items()
@@ -176,11 +188,10 @@ class SKLearnWrapper:
         )
         for k, v in self.constructor_kwargs.items():
             self._init_kwargs["model"][k] = v
-        if unrecognized:
-            for kw in unrecognized:
-                print(f"Received unknown keyword argument {kw}, probably ignoring.")
+        for kw in unrecognized:
+            print(f"Received unknown keyword argument {kw}, probably ignoring.")
 
-    # ---------- helpers ----------
+    # -------------------- helpers --------------------
     def _update_acceptable_kwargs(self, category, new_kwargs, acceptable=True):
         if acceptable:
             self.acceptable_kwargs[category] = list(
@@ -241,21 +252,19 @@ class SKLearnWrapper:
                 )
         return model
 
-    # ---------- internal: sanitize callbacks when no val loop ----------
     @staticmethod
     def _retarget_or_strip_early_stopping(cb, use_val: bool, train_monitor="train_loss"):
         try:
-            from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+            from pytorch_lightning.callbacks.early_stopping import EarlyStopping as _ES
         except Exception:
             return cb
-        if not isinstance(cb, EarlyStopping):
+        if not isinstance(cb, _ES):
             return cb
         if use_val:
             return cb
-        # No val loop -> if monitoring val_* (or nothing), rebuild to watch train_loss
         monitor = getattr(cb, "monitor", None)
         if (monitor is None) or (isinstance(monitor, str) and monitor.startswith("val_")):
-            return EarlyStopping(
+            return _ES(
                 monitor=train_monitor,
                 mode=getattr(cb, "mode", "min"),
                 patience=getattr(cb, "patience", 1),
@@ -264,12 +273,13 @@ class SKLearnWrapper:
             )
         return cb
 
-    # ---------- fit kwarg expansion (with DDP + ES logic) ----------
+    # -------------------- fit kwarg expansion --------------------
     def _organize_and_expand_fit_kwargs(self, **kwargs):
         organized, unrecognized = self._organize_kwargs(**kwargs)
-        # --- FORCE max_epochs to be set (avoid PL default=1000) ---
+
+        # Max epochs (avoid PL default 1000)
         max_epochs_cli = kwargs.get("max_epochs", None)
-        epochs_cli     = kwargs.get("epochs", None)
+        epochs_cli = kwargs.get("epochs", None)
         if max_epochs_cli is not None:
             organized["trainer"]["max_epochs"] = int(max_epochs_cli)
         elif epochs_cli is not None:
@@ -278,50 +288,44 @@ class SKLearnWrapper:
             organized["trainer"]["max_epochs"] = 3
 
         world_size = int(os.getenv("WORLD_SIZE", "1"))
-        use_val = organized["data"].get("val_split", DEFAULT_VAL_SPLIT) > 0.0
+        use_val = organized["data"].get("val_split", self.default_val_split) > 0.0
 
-        # Trainer base
+        # Trainer defaults
         organized["trainer"].setdefault("accelerator", self.accelerator)
         organized["trainer"].setdefault("enable_progress_bar", False)
         organized["trainer"].setdefault("logger", False)
         organized["trainer"].setdefault("enable_checkpointing", False)
         organized["trainer"].setdefault("num_sanity_val_steps", 0)
-        # conservative precision by default (TF32 is controlled globally)
         organized["trainer"].setdefault("precision", 32)
         if not use_val:
             organized["trainer"].setdefault("limit_val_batches", 0)
 
         if world_size > 1:
             organized["trainer"].setdefault("devices", world_size)
-            strat = organized["trainer"].get("strategy", "auto")
-            if strat == "auto" or isinstance(strat, str):
-                organized["trainer"]["strategy"] = DDPStrategy(
-                    find_unused_parameters=False,
-                    static_graph=True,
-                    gradient_as_bucket_view=True,
-                )
+            # Defer concrete object; prefer plain string for factory
+            organized["trainer"].setdefault("strategy", "ddp")
         else:
             organized["trainer"]["devices"] = 1
             organized["trainer"].setdefault("strategy", "auto")
             organized["trainer"].setdefault("plugins", [LightningEnvironment()])
 
-        # Defaults: model/data
+        # Model defaults
         def maybe_add(cat, k, default):
             if k in self.acceptable_kwargs[cat]:
                 organized[cat][k] = organized[cat].get(k, default)
 
-        # Model
-        maybe_add("model", "learning_rate", DEFAULT_LEARNING_RATE)
+        maybe_add("model", "learning_rate", self.default_learning_rate)
         maybe_add("model", "context_dim", self.context_dim)
         maybe_add("model", "x_dim", self.x_dim)
         maybe_add("model", "y_dim", self.y_dim)
         if organized["model"].get("num_archetypes", 1) == 0:
             organized["model"].pop("num_archetypes", None)
 
-        # Data (GPU-friendly)
-        maybe_add("data", "train_batch_size", DEFAULT_TRAIN_BATCH_SIZE)
-        maybe_add("data", "val_batch_size", DEFAULT_VAL_BATCH_SIZE)
-        maybe_add("data", "test_batch_size", DEFAULT_TEST_BATCH_SIZE)
+        # Data defaults (per-loader sizes)
+        maybe_add("data", "train_batch_size", self.default_train_batch_size)
+        maybe_add("data", "val_batch_size", self.default_val_batch_size)
+        maybe_add("data", "test_batch_size", self.default_test_batch_size)
+        maybe_add("data", "predict_batch_size", self.default_val_batch_size)
         maybe_add("data", "num_workers", 0)
         maybe_add("data", "pin_memory", (self.accelerator == "gpu"))
         maybe_add("data", "persistent_workers", False)
@@ -330,45 +334,43 @@ class SKLearnWrapper:
         maybe_add("data", "shuffle_eval", False)
         maybe_add("data", "dtype", torch.float)
 
-        # Wrapper
-        maybe_add("wrapper", "n_bootstraps", DEFAULT_N_BOOTSTRAPS)
+        # Wrapper defaults
+        maybe_add("wrapper", "n_bootstraps", self.default_n_bootstraps)
 
-        # Callbacks (EarlyStopping only if we validate; else watch train_loss)
+        # EarlyStopping/Checkpoint constructors (sanitized later if no val)
         es_monitor = organized["wrapper"].get("es_monitor", "val_loss" if use_val else "train_loss")
         es_mode = organized["wrapper"].get("es_mode", "min")
-        es_patience = organized["wrapper"].get("es_patience", DEFAULT_ES_PATIENCE)
+        es_patience = organized["wrapper"].get("es_patience", self.default_es_patience)
         es_verbose = organized["wrapper"].get("es_verbose", False)
         es_min_delta = organized["wrapper"].get("es_min_delta", 0.0)
 
-        callbacks_list = []
+        cb_ctors = organized["trainer"].get("callback_constructors", [])
         if use_val:
-            callbacks_list.append(
+            cb_ctors.append(
                 lambda i: EarlyStopping(
                     monitor=es_monitor, mode=es_mode, patience=es_patience,
                     verbose=es_verbose, min_delta=es_min_delta
                 )
             )
         if organized["trainer"].get("enable_checkpointing", False):
-            callbacks_list.append(
+            cb_ctors.append(
                 lambda i: ModelCheckpoint(
                     monitor="val_loss" if use_val else None,
                     dirpath=f"{kwargs.get('checkpoint_path', './lightning_logs')}/boot_{i}_checkpoints",
                     filename="{epoch}-{val_loss:.4f}" if use_val else "{epoch}",
                 )
             )
-        organized["trainer"].setdefault("callback_constructors", callbacks_list)
+        organized["trainer"]["callback_constructors"] = cb_ctors
 
-        if unrecognized:
-            for kw in unrecognized:
-                print(f"Received unknown keyword argument {kw}, probably ignoring.")
+        for kw in unrecognized:
+            print(f"Received unknown keyword argument {kw}, probably ignoring.")
 
-        # ---- merge constructor-time defaults as fallbacks ----
+        # Merge __init__ defaults as fallbacks
         for category, cat_kwargs in self._init_kwargs.items():
             for k, v in cat_kwargs.items():
                 organized[category].setdefault(k, v)
 
-        # ---- sanitize any pre-specified callbacks for no-val runs ----
-        # (handles both direct 'callbacks' and deferred 'callback_constructors')
+        # Sanitize any pre-specified callbacks for no-val runs
         cb_list = organized["trainer"].get("callbacks", [])
         cb_list = [self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list]
         organized["trainer"]["callbacks"] = cb_list
@@ -379,12 +381,11 @@ class SKLearnWrapper:
                 cb = ctor(i)
                 return self._retarget_or_strip_early_stopping(cb, use_val)
             return _wrapped
-        ctor_list = [_wrap_ctor(c) for c in ctor_list]
-        organized["trainer"]["callback_constructors"] = ctor_list
+        organized["trainer"]["callback_constructors"] = [_wrap_ctor(c) for c in ctor_list]
 
         return organized
 
-    # ---------- data module builder ----------
+    # -------------------- data module builder --------------------
     def _build_datamodule(
         self,
         C: np.ndarray,
@@ -399,10 +400,13 @@ class SKLearnWrapper:
         task_type: str = "singletask_multivariate",
     ) -> ContextualizedRegressionDataModule:
         dk = dict(
-            batch_size=self.default_train_batch_size,
+            train_batch_size=self.default_train_batch_size,
+            val_batch_size=self.default_val_batch_size,
+            test_batch_size=self.default_test_batch_size,
+            predict_batch_size=self.default_val_batch_size,
             num_workers=0,
             pin_memory=(self.accelerator == "gpu"),
-            persistent_workers=False,   # caller can override
+            persistent_workers=False,
             drop_last=False,
             shuffle_train=True,
             shuffle_eval=False,
@@ -420,7 +424,10 @@ class SKLearnWrapper:
             val_idx=val_idx,
             test_idx=test_idx,
             predict_idx=predict_idx,
-            batch_size=dk["batch_size"],
+            train_batch_size=dk["train_batch_size"],
+            val_batch_size=dk["val_batch_size"],
+            test_batch_size=dk["test_batch_size"],
+            predict_batch_size=dk["predict_batch_size"],
             num_workers=dk["num_workers"],
             pin_memory=dk["pin_memory"],
             persistent_workers=dk["persistent_workers"],
@@ -433,15 +440,38 @@ class SKLearnWrapper:
         dm.setup()
         return dm
 
-    # ---------- split helper ----------
-    def _split_indices(self, n: int, val_split: float):
-        if val_split <= 0.0:
+    # -------------------- split helpers --------------------
+    def _split_train_data(
+        self,
+        C: np.ndarray,
+        X: np.ndarray,
+        Y: Optional[np.ndarray] = None,
+        *,
+        Y_required: bool = True,
+        val_split: Optional[float] = None,
+        random_state: Optional[int] = None,
+        shuffle: bool = True,
+        **_,
+    ):
+        """
+        Return (train_idx, val_idx) over rows; Lightning will attach DistributedSamplers.
+        """
+        if Y_required and Y is None:
+            raise ValueError("Y is required but was not provided.")
+        n = C.shape[0]
+        vs = self.default_val_split if val_split is None else float(val_split)
+        if vs <= 0.0:
             idx = np.arange(n)
             return idx, None
-        tr_idx, va_idx = train_test_split(np.arange(n), test_size=val_split, shuffle=True)
+        tr_idx, va_idx = train_test_split(
+            np.arange(n),
+            test_size=vs,
+            shuffle=shuffle,
+            random_state=random_state,
+        )
         return tr_idx, va_idx
 
-    # ---------- optional scaling ----------
+    # -------------------- optional scaling --------------------
     def _maybe_scale_C(self, C: np.ndarray) -> np.ndarray:
         if self.normalize and self.scalers["C"] is not None:
             return self.scalers["C"].transform(C)
@@ -452,7 +482,7 @@ class SKLearnWrapper:
             return self.scalers["X"].transform(X)
         return X
 
-    # ---------- public API ----------
+    # -------------------- public API --------------------
     def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
         if not hasattr(self, "models") or self.models is None:
             raise ValueError("Trying to predict with a model that hasn't been trained yet.")
@@ -467,7 +497,10 @@ class SKLearnWrapper:
                 C=Cq, X=Xq, Y=Yq,
                 predict_idx=np.arange(len(Cq)),
                 data_kwargs=dict(
-                    batch_size=self._init_kwargs["data"].get("val_batch_size", DEFAULT_VAL_BATCH_SIZE),
+                    train_batch_size=self._init_kwargs["data"].get("train_batch_size", self.default_train_batch_size),
+                    val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
+                    test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
+                    predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
                     pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
                     persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
@@ -513,7 +546,10 @@ class SKLearnWrapper:
                 Y=Y_zero if kwargs.pop("uses_y", True) else None,
                 predict_idx=np.arange(len(Cq)),
                 data_kwargs=dict(
-                    batch_size=self._init_kwargs["data"].get("val_batch_size", DEFAULT_VAL_BATCH_SIZE),
+                    train_batch_size=self._init_kwargs["data"].get("train_batch_size", self.default_train_batch_size),
+                    val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
+                    test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
+                    predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
                     pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
                     persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
@@ -540,25 +576,53 @@ class SKLearnWrapper:
     def fit(self, *args, **kwargs) -> None:
         """
         Fit contextualized model to data.
-        Args:
-            C (np.ndarray): (n, c_dim)
-            X (np.ndarray): (n, x_dim)
-            Y (np.ndarray, optional): (n, y_dim)
+
+        Accepts either:
+          - (C, X, Y)  [canonical order], OR
+          - (X, Y, C)  [README order], OR
+          - kw-only: C=..., X=..., (Y=...)
         """
         self.models, self.trainers = [], []
 
-        C, X = args[0], args[1]
+        # normalize argument order 
+        C_in = kwargs.pop("C", None)
+        X_in = kwargs.pop("X", None)
+        Y_in = kwargs.pop("Y", None)
+
+        if (C_in is not None) and (X_in is not None):
+            C, X, Y = C_in, X_in, Y_in
+        else:
+            if len(args) == 3:
+                A, B, Carg = args
+                if A.shape[0] == B.shape[0] == Carg.shape[0]:
+                    if (B.ndim == 1) or (B.ndim == 2 and B.shape[1] <= 4):
+                        X, Y, C = A, B, Carg
+                    else:
+                        C, X, Y = A, B, Carg
+                else:
+                    raise ValueError("Mismatched sample counts among provided arrays.")
+            elif len(args) == 2:
+                A, B = args
+                if A.shape[0] != B.shape[0]:
+                    raise ValueError("Mismatched sample counts for two-argument fit.")
+                # Assume (C, X) by default
+                C, X, Y = A, B, None
+            else:
+                raise ValueError("fit expects (C,X[,Y]) or (X,Y,C) or kw-only C=..., X=...")
+
+        # Optional scaling
         if self.normalize:
             if self.scalers["C"] is None: self.scalers["C"] = StandardScaler().fit(C)
             C = self.scalers["C"].transform(C)
             if self.scalers["X"] is None: self.scalers["X"] = StandardScaler().fit(X)
             X = self.scalers["X"].transform(X)
-        self.context_dim = C.shape[-1]; self.x_dim = X.shape[-1]
 
-        if len(args) == 3:
-            Y = args[2]
-            if kwargs.get("Y", None) is not None: Y = kwargs.get("Y")
-            if len(Y.shape) == 1: Y = np.expand_dims(Y, 1)
+        self.context_dim = C.shape[-1]
+        self.x_dim = X.shape[-1]
+
+        if Y is not None:
+            if len(Y.shape) == 1:
+                Y = np.expand_dims(Y, 1)
             if self.normalize and not np.array_equal(np.unique(Y), np.array([0, 1])):
                 if self.scalers["Y"] is None: self.scalers["Y"] = StandardScaler().fit(Y)
                 Y = self.scalers["Y"].transform(Y)
@@ -572,18 +636,22 @@ class SKLearnWrapper:
         self.n_bootstraps = organized["wrapper"].get("n_bootstraps", self.n_bootstraps)
 
         n = C.shape[0]
-        val_split = organized["data"].get("val_split", DEFAULT_VAL_SPLIT)
+        val_split = organized["data"].get("val_split", self.default_val_split)
         use_val = val_split > 0.0
 
         for b in range(self.n_bootstraps):
-            # Build model (LightningModule)
+            # Model (LightningModule)
             _model_kwargs = dict(organized["model"])
-            _model_kwargs.pop("univariate", None)
+            _model_kwargs.pop("univariate", None)  # handled via task_type below
             model = self.base_constructor(**_model_kwargs)
             self.model_ = model
 
             # Indices
-            train_idx, val_idx = self._split_indices(n, val_split)
+            train_idx, val_idx = self._split_train_data(
+                C, X, (args[2] if len(args) == 3 else None),
+                Y_required=(len(args) == 3),
+                val_split=val_split,
+            )
             test_idx = None
 
             # DataModule
@@ -592,7 +660,10 @@ class SKLearnWrapper:
                 C=args[0], X=args[1], Y=(args[2] if len(args) == 3 else None),
                 train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
                 data_kwargs=dict(
-                    batch_size=organized["data"].get("train_batch_size", DEFAULT_TRAIN_BATCH_SIZE),
+                    train_batch_size=organized["data"].get("train_batch_size", self.default_train_batch_size),
+                    val_batch_size=organized["data"].get("val_batch_size", self.default_val_batch_size),
+                    test_batch_size=organized["data"].get("test_batch_size", self.default_test_batch_size),
+                    predict_batch_size=organized["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=organized["data"].get("num_workers", 0),
                     pin_memory=organized["data"].get("pin_memory", (self.accelerator == "gpu")),
                     persistent_workers=organized["data"].get("persistent_workers", False),
@@ -609,7 +680,7 @@ class SKLearnWrapper:
             trainer_kwargs["callbacks"] = [f(b) for f in trainer_kwargs.get("callback_constructors", [])]
             trainer_kwargs.pop("callback_constructors", None)
 
-            # Build via factory (handles env quirks)
+            # Build via factory (respects strategy strings and env)
             from contextualized.regression.trainers import make_trainer_with_env
             trainer = make_trainer_with_env(
                 self.trainer_constructor,
@@ -621,7 +692,7 @@ class SKLearnWrapper:
                 if isinstance(cb, ModelCheckpoint):
                     os.makedirs(cb.dirpath, exist_ok=True)
 
-            # Fit (don’t pass val loader if no val split)
+            # Fit (omit val loader if no val split)
             if use_val and dm.val_dataloader() is not None:
                 trainer.fit(
                     model,
@@ -636,9 +707,8 @@ class SKLearnWrapper:
                     **organized["fit"],
                 )
 
-            # (Optional) load best ckpt if checkpointing enabled
-            max_epochs = trainer_kwargs.get("max_epochs", 1)
-            if max_epochs and trainer_kwargs.get("enable_checkpointing", False):
+            # Load best checkpoint if enabled
+            if trainer_kwargs.get("enable_checkpointing", False):
                 ckpt_cb = next((cb for cb in trainer.callbacks if isinstance(cb, ModelCheckpoint)), None)
                 if ckpt_cb and ckpt_cb.best_model_path and os.path.exists(ckpt_cb.best_model_path):
                     best = torch.load(ckpt_cb.best_model_path, map_location="cpu")
