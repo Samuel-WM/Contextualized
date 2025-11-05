@@ -67,6 +67,25 @@ class Explainer(SoftSelect):
     def __init__(self, k, out_shape):
         super().__init__((k,), out_shape)
 
+def _resolve_link_fn(maybe_link):
+    """
+    Accepts either:
+      - a string key (looked up in LINK_FUNCTIONS), or
+      - a callable (returned as-is, including functools.partial)
+    """
+    if isinstance(maybe_link, str):
+        try:
+            return LINK_FUNCTIONS[maybe_link]
+        except KeyError as e:
+            raise KeyError(
+                f"Unknown link_fn '{maybe_link}'. "
+                f"Valid options: {list(LINK_FUNCTIONS.keys())}"
+            ) from e
+    if callable(maybe_link):
+        return maybe_link
+    raise TypeError(f"link_fn must be str or callable, got {type(maybe_link).__name__}")
+
+
 
 class MLP(nn.Module):
     """
@@ -91,7 +110,8 @@ class MLP(nn.Module):
         else:  # Linear encoder
             mlp_layers = [nn.Linear(input_dim, output_dim)]
         self.mlp = nn.Sequential(*mlp_layers)
-        self.link_fn = LINK_FUNCTIONS[link_fn]
+        self.link_fn = _resolve_link_fn(link_fn)
+
 
     def forward(self, X):
         """Torch Forward pass."""
@@ -101,7 +121,9 @@ class MLP(nn.Module):
 
 class NGAM(nn.Module):
     """
-    Neural generalized additive model
+    Neural generalized additive model: sum_i f_i(x_i).
+    Each f_i is an MLP that outputs (B, output_dim).
+    The final link function is applied once to the summed output.
     """
 
     def __init__(
@@ -114,8 +136,12 @@ class NGAM(nn.Module):
         link_fn="identity",
     ):
         super().__init__()
-        self.intput_dim = input_dim
+        self.input_dim = input_dim
         self.output_dim = output_dim
+
+        # Internal NAM pieces should be identity-linked; the global link is applied after summation.
+        per_feat_link = "identity"
+
         self.nams = nn.ModuleList(
             [
                 MLP(
@@ -124,19 +150,20 @@ class NGAM(nn.Module):
                     width,
                     layers,
                     activation=activation,
-                    link_fn=identity_link,
+                    link_fn=per_feat_link,
                 )
                 for _ in range(input_dim)
             ]
         )
-        self.link_fn = LINK_FUNCTIONS[link_fn]
+        self.link_fn = _resolve_link_fn(link_fn)
 
     def forward(self, X):
-        """Torch Forward pass."""
+        """X: (B, input_dim)"""
         ret = self.nams[0](X[:, 0].unsqueeze(-1))
-        for i, nam in enumerate(self.nams[1:]):
+        for i, nam in enumerate(self.nams[1:], start=1):
             ret += nam(X[:, i].unsqueeze(-1))
         return self.link_fn(ret)
+
 
 
 class Linear(nn.Module):

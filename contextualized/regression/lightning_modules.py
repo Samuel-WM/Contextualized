@@ -18,11 +18,11 @@ from abc import abstractmethod
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-import lightning as pl
-
+import pytorch_lightning as pl
 from contextualized.regression.regularizers import REGULARIZERS
-from contextualized.regression.losses import MSE
+from contextualized.regression.losses import MSE   
 from contextualized.functions import LINK_FUNCTIONS
+
 
 from contextualized.regression.metamodels import (
     NaiveMetamodel,
@@ -32,6 +32,57 @@ from contextualized.regression.metamodels import (
     SINGLE_TASK_METAMODELS,
     MULTITASK_METAMODELS,
 )
+
+# --- Accept both string registry keys and callables for link_fn / loss_fn ---
+def _resolve_registry_or_callable(maybe_obj, registry, name: str):
+    """Return a function from a registry by key, or the callable directly."""
+    if isinstance(maybe_obj, str):
+        try:
+            return registry[maybe_obj]
+        except KeyError as e:
+            raise KeyError(
+                f"Unknown {name} '{maybe_obj}'. Valid keys: {list(registry.keys())}"
+            ) from e
+    if callable(maybe_obj):
+        return maybe_obj
+    raise TypeError(f"{name} must be a string key or a callable, got {type(maybe_obj).__name__}")
+
+
+def _resolve_loss(maybe_loss):
+    """
+    Allow:
+      * 'mse' string (maps to local MSE),
+      * any callable (already constructed loss),
+    and reject unknown strings to avoid circular imports with package-level registries.
+    """
+    if isinstance(maybe_loss, str):
+        if maybe_loss.lower() == "mse":
+            return MSE
+        raise KeyError(
+            f"Unknown loss_fn '{maybe_loss}'. "
+            "Pass a callable loss or the string 'mse'."
+        )
+    if callable(maybe_loss):
+        return maybe_loss
+    raise TypeError(f"loss_fn must be a string key or a callable, got {type(maybe_loss).__name__}")
+# ---------------------------------------------------------------------------
+def _resolve_regularizer(maybe_reg):
+    """
+    Allow:
+      * string key -> lookup in REGULARIZERS
+      * callable -> pass through directly
+    """
+    if isinstance(maybe_reg, str):
+        try:
+            return REGULARIZERS[maybe_reg]
+        except KeyError as e:
+            raise KeyError(
+                f"Unknown model_regularizer '{maybe_reg}'. "
+                f"Valid keys: {list(REGULARIZERS.keys())}"
+            ) from e
+    if callable(maybe_reg):
+        return maybe_reg
+    raise TypeError(f"model_regularizer must be a string key or a callable, got {type(maybe_reg).__name__}")
 
 
 class ContextualizedRegressionBase(pl.LightningModule):
@@ -369,12 +420,11 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         super().__init__()
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
-        self.link_fn = LINK_FUNCTIONS[link_fn]
-        if loss_fn == "mse":
-            self.loss_fn = MSE
-        else:
-            raise ValueError("Supported loss_fn's: mse")
-        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
+        self.loss_fn = _resolve_loss(loss_fn)
+
+        self.model_regularizer = _resolve_regularizer(model_regularizer)
+
         self.base_y_predictor = base_y_predictor
         self.base_param_predictor = base_param_predictor
         if metamodel_type == "subtype":
@@ -533,12 +583,11 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
         super().__init__()
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
-        self.link_fn = LINK_FUNCTIONS[link_fn]
-        if loss_fn == "mse":
-            self.loss_fn = MSE
-        else:
-            raise ValueError("Supported loss_fn's: mse")
-        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
+        self.loss_fn = _resolve_loss(loss_fn)
+
+        self.model_regularizer = _resolve_regularizer(model_regularizer)
+
         self.metamodel = MultitaskMetamodel(
             context_dim=context_dim,
             x_dim=x_dim,
@@ -677,12 +726,11 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
         self.learning_rate = learning_rate
         self.metamodel_type = metamodel_type
         self.fit_intercept = fit_intercept
-        self.link_fn = LINK_FUNCTIONS[link_fn]
-        if loss_fn == "mse":
-            self.loss_fn = MSE
-        else:
-            raise ValueError("Supported loss_fn's: mse")
-        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
+        self.loss_fn = _resolve_loss(loss_fn)
+
+        self.model_regularizer = _resolve_regularizer(model_regularizer)
+
         self.metamodel = TasksplitMetamodel(
             context_dim=context_dim,
             x_dim=x_dim,
@@ -842,12 +890,11 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         super().__init__()
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
-        self.link_fn = LINK_FUNCTIONS[link_fn]
-        if loss_fn == "mse":
-            self.loss_fn = MSE
-        else:
-            raise ValueError("Supported loss_fn's: mse")
-        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
+        self.loss_fn = _resolve_loss(loss_fn)
+
+        self.model_regularizer = _resolve_regularizer(model_regularizer)
+
         self.base_y_predictor = base_y_predictor
         self.base_param_predictor = base_param_predictor
         if metamodel_type == "subtype":
@@ -978,12 +1025,11 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
         super().__init__()
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
-        self.link_fn = LINK_FUNCTIONS[link_fn]
-        if loss_fn == "mse":
-            self.loss_fn = MSE
-        else:
-            raise ValueError("Supported loss_fn's: mse")
-        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
+        self.loss_fn = _resolve_loss(loss_fn)
+
+        self.model_regularizer = _resolve_regularizer(model_regularizer)
+
         self.metamodel = MultitaskMetamodel(
             context_dim=context_dim,
             x_dim=x_dim,
@@ -1076,12 +1122,11 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
         super().__init__()
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
-        self.link_fn = LINK_FUNCTIONS[link_fn]
-        if loss_fn == "mse":
-            self.loss_fn = MSE
-        else:
-            raise ValueError("Supported loss_fn's: mse")
-        self.model_regularizer = REGULARIZERS[model_regularizer]
+        self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
+        self.loss_fn = _resolve_loss(loss_fn)
+
+        self.model_regularizer = _resolve_regularizer(model_regularizer)
+
         self.metamodel = TasksplitMetamodel(
             context_dim=context_dim,
             x_dim=x_dim,
@@ -1203,24 +1248,19 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
         beta_hat, mu_hat = self(batch)
-        beta_hat = beta_hat.squeeze(-1)
+        beta_hat = beta_hat.squeeze(-1)              # (B, y, x)
         beta_hat_T = beta_hat.transpose(1, 2)
         signs = torch.sign(beta_hat)
         signs[signs != signs.transpose(1, 2)] = 0
         correlations = signs * torch.sqrt(torch.abs(beta_hat * beta_hat_T))
         batch.update({
-            "betas": beta_hat.squeeze(-1),
+            "betas": beta_hat,                        # already squeezed
             "mus": mu_hat.squeeze(-1),
             "correlations": correlations,
         })
         return batch
+
 
 
 class MultitaskContextualizedCorrelation(MultitaskContextualizedUnivariateRegression):
@@ -1272,32 +1312,16 @@ class ContextualizedNeighborhoodSelection(ContextualizedRegression):
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
-        C, _, _, _ = batch
-        beta_hat, mu_hat = self(C)
+        beta_hat, mu_hat = self(batch)  # self.forward expects dict batch
+        # Zero diagonal (mask pre-registered in __init__)
         beta_hat = beta_hat * self.diag_mask.expand(beta_hat.shape[0], -1, -1)
-        return beta_hat, mu_hat
+        batch.update({
+            "betas": beta_hat,
+            "mus": mu_hat,
+        })
+        return batch
 
-    def dataloader(self, C, X, Y=None, **kwargs):
-        """
 
-        :param C:
-        :param X:
-        :param Y:
-        :param **kwargs:
-
-        """
-
-        if Y is not None:
-            print(
-                "Passed a Y, but this is a Markov Graph between X featuers. Ignoring Y."
-            )
-        return super().dataloader(C, X, X, **kwargs)
 
 
 class ContextualizedMarkovGraph(ContextualizedRegression):
@@ -1315,32 +1339,13 @@ class ContextualizedMarkovGraph(ContextualizedRegression):
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
-        C, _, _, _ = batch
-        beta_hat, mu_hat = self(C)
-        beta_hat = beta_hat + torch.transpose(
-            beta_hat, 1, 2
-        )  # hotfix to enforce symmetry
+        beta_hat, mu_hat = self(batch)  # dict batch
+        # Enforce symmetry (hotfix) and zero diagonal
+        beta_hat = beta_hat + beta_hat.transpose(1, 2)
         beta_hat = beta_hat * self.diag_mask.expand(beta_hat.shape[0], -1, -1)
-        return beta_hat, mu_hat
+        batch.update({
+            "betas": beta_hat,
+            "mus": mu_hat,
+        })
+        return batch
 
-    def dataloader(self, C, X, Y=None, **kwargs):
-        """
-
-        :param C:
-        :param X:
-        :param Y:
-        :param **kwargs:
-
-        """
-
-        if Y is not None:
-            print(
-                "Passed a Y, but this is a Markov Graph between X featuers. Ignoring Y."
-            )
-        return super().dataloader(C, X, X, **kwargs)

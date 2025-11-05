@@ -1,20 +1,19 @@
-"""
-An sklearn-like wrapper for Contextualized models.
-"""
-
+# --- imports you need above the class ---
 import copy
 import os
 from typing import *
-
 import numpy as np
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.callbacks import ModelCheckpoint
+import torch
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import torch
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.plugins.environments import LightningEnvironment
+from pytorch_lightning.strategies import DDPStrategy  # PL v1 Strategy API
 
 from contextualized.functions import LINK_FUNCTIONS
 from contextualized.regression import REGULARIZERS, LOSSES
+from contextualized.regression.datamodules import ContextualizedRegressionDataModule
 
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_N_BOOTSTRAPS = 1
@@ -32,23 +31,10 @@ DEFAULT_NORMALIZE = False
 
 class SKLearnWrapper:
     """
-    An sklearn-like wrapper for Contextualized models.
-
-    Args:
-        base_constructor (class): The base class to construct the model.
-        extra_model_kwargs (dict): Extra kwargs to pass to the model constructor.
-        extra_data_kwargs (dict): Extra kwargs to pass to the dataloader constructor.
-        trainer_constructor (class): The trainer class to use.
-        n_bootstraps (int, optional): Number of bootstraps to use. Defaults to 1.
-        encoder_type (str, optional): Type of encoder to use ("mlp", "ngam", "linear"). Defaults to "mlp".
-        loss_fn (torch.nn.Module, optional): Loss function. Defaults to LOSSES["mse"].
-        link_fn (torch.nn.Module, optional): Link function. Defaults to LINK_FUNCTIONS["identity"].
-        alpha (float, optional): Regularization strength. Defaults to 0.0.
-        mu_ratio (float, optional): Float in range (0.0, 1.0), governs how much the regularization applies to context-specific parameters or context-specific offsets.
-        l1_ratio (float, optional): Float in range (0.0, 1.0), governs how much the regularization penalizes l1 vs l2 parameter norms.
-        normalize (bool, optional): If True, automatically standardize inputs during training and inverse-transform predictions. Defaults to False.
+    An sklearn-like wrapper for Contextualized models, optimized for multi-GPU (DDP) scaling.
     """
 
+    # ---------- defaults ----------
     def _set_defaults(self):
         self.default_learning_rate = DEFAULT_LEARNING_RATE
         self.default_n_bootstraps = DEFAULT_N_BOOTSTRAPS
@@ -73,17 +59,20 @@ class SKLearnWrapper:
     ):
         self._set_defaults()
         self.base_constructor = base_constructor
+        self.trainer_constructor = trainer_constructor
+
         self.n_bootstraps = 1
         self.models = None
         self.trainers = None
-        self.dataloaders = None
+
         self.normalize = kwargs.pop("normalize", self.default_normalize)
         self.scalers = {"C": None, "X": None, "Y": None}
         self.context_dim = None
         self.x_dim = None
         self.y_dim = None
-        self.trainer_constructor = trainer_constructor
         self.accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+
+        # Acceptable kwargs routing
         self.acceptable_kwargs = {
             "data": [
                 "train_batch_size",
@@ -92,6 +81,13 @@ class SKLearnWrapper:
                 "C_val",
                 "X_val",
                 "val_split",
+                "num_workers",
+                "pin_memory",
+                "persistent_workers",
+                "drop_last",
+                "shuffle_train",
+                "shuffle_eval",
+                "dtype",
             ],
             "model": [
                 "loss_fn",
@@ -104,6 +100,7 @@ class SKLearnWrapper:
                 "learning_rate",
                 "context_dim",
                 "x_dim",
+                "y_dim",
             ],
             "trainer": [
                 "max_epochs",
@@ -112,6 +109,17 @@ class SKLearnWrapper:
                 "callbacks",
                 "callback_constructors",
                 "accelerator",
+                "devices",
+                "strategy",
+                "plugins",
+                "logger",
+                "enable_checkpointing",
+                "num_sanity_val_steps",
+                "default_root_dir",
+                "log_every_n_steps",
+                "precision",  # allow explicit precision override if desired
+                "enable_progress_bar",
+                "limit_val_batches",
             ],
             "fit": [],
             "wrapper": [
@@ -132,6 +140,7 @@ class SKLearnWrapper:
         self._update_acceptable_kwargs(
             "data", kwargs.pop("remove_data_kwargs", []), acceptable=False
         )
+
         self.convenience_kwargs = [
             "alpha",
             "l1_ratio",
@@ -141,6 +150,8 @@ class SKLearnWrapper:
             "layers",
             "encoder_link_fn",
         ]
+
+        # Model constructor kwargs
         self.constructor_kwargs = self._organize_constructor_kwargs(**kwargs)
         self.constructor_kwargs["encoder_kwargs"]["width"] = kwargs.pop(
             "width", self.constructor_kwargs["encoder_kwargs"]["width"]
@@ -159,106 +170,18 @@ class SKLearnWrapper:
             for k, v in kwargs.items()
             if k not in self.constructor_kwargs and k not in self.convenience_kwargs
         }
-        # Some args will not be ignored by wrapper because sub-class will handle them.
-        # self.private_kwargs = kwargs.pop("private_kwargs", [])
-        # self.private_kwargs.append("private_kwargs")
-        # Add Predictor-Specific kwargs for parsing.
-        self._init_kwargs, unrecognized_general_kwargs = self._organize_kwargs(
+
+        self._init_kwargs, unrecognized = self._organize_kwargs(
             **self.not_constructor_kwargs
         )
-        for key, value in self.constructor_kwargs.items():
-            self._init_kwargs["model"][key] = value
-        recognized_private_init_kwargs = self._parse_private_init_kwargs(**kwargs)
-        for kwarg in set(unrecognized_general_kwargs) - set(
-            recognized_private_init_kwargs
-        ):
-            print(f"Received unknown keyword argument {kwarg}, probably ignoring.")
+        for k, v in self.constructor_kwargs.items():
+            self._init_kwargs["model"][k] = v
+        if unrecognized:
+            for kw in unrecognized:
+                print(f"Received unknown keyword argument {kw}, probably ignoring.")
 
-    def _organize_and_expand_fit_kwargs(self, **kwargs):
-        """
-        Private function to organize kwargs passed to constructor or
-        fit function.
-        """
-        organized_kwargs, unrecognized_general_kwargs = self._organize_kwargs(**kwargs)
-        recognized_private_kwargs = self._parse_private_fit_kwargs(**kwargs)
-        for kwarg in set(unrecognized_general_kwargs) - set(recognized_private_kwargs):
-            print(f"Received unknown keyword argument {kwarg}, probably ignoring.")
-        # Add kwargs from __init__ to organized_kwargs, keeping more recent kwargs.
-        for category, category_kwargs in self._init_kwargs.items():
-            for key, value in category_kwargs.items():
-                if key not in organized_kwargs[category]:
-                    organized_kwargs[category][key] = value
-
-        # Add necessary kwargs.
-        def maybe_add_kwarg(category, kwarg, default_val):
-            if kwarg in self.acceptable_kwargs[category]:
-                organized_kwargs[category][kwarg] = organized_kwargs[category].get(
-                    kwarg, default_val
-                )
-
-        # Model
-        maybe_add_kwarg("model", "learning_rate", self.default_learning_rate)
-        maybe_add_kwarg("model", "context_dim", self.context_dim)
-        maybe_add_kwarg("model", "x_dim", self.x_dim)
-        maybe_add_kwarg("model", "y_dim", self.y_dim)
-        if (
-            "num_archetypes" in organized_kwargs["model"]
-            and organized_kwargs["model"]["num_archetypes"] == 0
-        ):
-            del organized_kwargs["model"]["num_archetypes"]
-
-        # Data
-        maybe_add_kwarg("data", "train_batch_size", self.default_train_batch_size)
-        maybe_add_kwarg("data", "val_batch_size", self.default_val_batch_size)
-        maybe_add_kwarg("data", "test_batch_size", self.default_test_batch_size)
-
-        # Wrapper
-        maybe_add_kwarg("wrapper", "n_bootstraps", self.default_n_bootstraps)
-
-        # Trainer
-        maybe_add_kwarg(
-            "trainer",
-            "callback_constructors",
-            [
-                lambda i: EarlyStopping(
-                    monitor=kwargs.get("es_monitor", "val_loss"),
-                    mode=kwargs.get("es_mode", "min"),
-                    patience=kwargs.get("es_patience", self.default_es_patience),
-                    verbose=kwargs.get("es_verbose", False),
-                    min_delta=kwargs.get("es_min_delta", 0.00),
-                )
-            ],
-        )
-        organized_kwargs["trainer"]["callback_constructors"].append(
-            lambda i: ModelCheckpoint(
-                monitor=kwargs.get("es_monitor", "val_loss"),
-                dirpath=f"{kwargs.get('checkpoint_path', './lightning_logs')}/boot_{i}_checkpoints",
-                filename="{epoch}-{val_loss:.2f}",
-            )
-        )
-        maybe_add_kwarg("trainer", "accelerator", self.accelerator)
-        return organized_kwargs
-
-    def _parse_private_fit_kwargs(self, **kwargs):
-        """
-        Parse private (model-specific) kwargs passed to fit function.
-        Return the list of parsed kwargs.
-        """
-        return []
-
-    def _parse_private_init_kwargs(self, **kwargs):
-        """
-        Parse private (model-specific) kwargs passed to constructor.
-        Return the list of parsed kwargs.
-        """
-        return []
-
+    # ---------- helpers ----------
     def _update_acceptable_kwargs(self, category, new_kwargs, acceptable=True):
-        """
-        Helper function to update the acceptable kwargs.
-        If acceptable=True, the new kwargs will be added to the list of acceptable kwargs.
-        If acceptable=False, the new kwargs will be removed from the list of acceptable kwargs.
-        """
         if acceptable:
             self.acceptable_kwargs[category] = list(
                 set(self.acceptable_kwargs[category]).union(set(new_kwargs))
@@ -269,139 +192,256 @@ class SKLearnWrapper:
             )
 
     def _organize_kwargs(self, **kwargs):
-        """
-        Private helper function to organize kwargs passed to constructor or
-        fit function.
-        Organizes kwargs into data, model, trainer, fit, and wrapper categories.
-        """
-
-        # Combine default allowed keywords with subclass-specfic
-        organized_kwargs = {category: {} for category in self.acceptable_kwargs}
-        unrecognized_kwargs = []
-        for kwarg, value in kwargs.items():
-            # if kwarg in self.private_kwargs:
-            #    continue
-            not_found = True
-            for category, category_kwargs in self.acceptable_kwargs.items():
-                if kwarg in category_kwargs:
-                    organized_kwargs[category][kwarg] = value
-                    not_found = False
+        out = {cat: {} for cat in self.acceptable_kwargs}
+        unknown = []
+        for k, v in kwargs.items():
+            placed = False
+            for cat, allowed in self.acceptable_kwargs.items():
+                if k in allowed:
+                    out[cat][k] = v
+                    placed = True
                     break
-            if not_found:
-                unrecognized_kwargs.append(kwarg)
-
-        return organized_kwargs, unrecognized_kwargs
+            if not placed:
+                unknown.append(k)
+        return out, unknown
 
     def _organize_constructor_kwargs(self, **kwargs):
-        """
-        Helper function to set all the default constructor or changes allowed.
-        """
-        constructor_kwargs = {}
+        model = {}
 
-        def maybe_add_constructor_kwarg(kwarg, default_val):
-            if kwarg in self.acceptable_kwargs["model"]:
-                constructor_kwargs[kwarg] = kwargs.get(kwarg, default_val)
+        def maybe_add(kw, default_val):
+            if kw in self.acceptable_kwargs["model"]:
+                model[kw] = kwargs.get(kw, default_val)
 
-        maybe_add_constructor_kwarg("link_fn", LINK_FUNCTIONS["identity"])
-        maybe_add_constructor_kwarg("univariate", False)
-        maybe_add_constructor_kwarg("encoder_type", self.default_encoder_type)
-        maybe_add_constructor_kwarg("loss_fn", LOSSES["mse"])
-        maybe_add_constructor_kwarg(
+        maybe_add("link_fn", LINK_FUNCTIONS["identity"])
+        maybe_add("univariate", False)
+        maybe_add("encoder_type", DEFAULT_ENCODER_TYPE)
+        maybe_add("loss_fn", LOSSES["mse"])
+        maybe_add(
             "encoder_kwargs",
             {
-                "width": kwargs.get("encoder_width", self.default_encoder_width),
-                "layers": kwargs.get("encoder_layers", self.default_encoder_layers),
-                "link_fn": kwargs.get("encoder_link_fn", self.default_encoder_link_fn),
+                "width": kwargs.get("encoder_width", DEFAULT_ENCODER_WIDTH),
+                "layers": kwargs.get("encoder_layers", DEFAULT_ENCODER_LAYERS),
+                "link_fn": kwargs.get("encoder_link_fn", DEFAULT_ENCODER_LINK_FN),
             },
         )
         if kwargs.get("subtype_probabilities", False):
-            constructor_kwargs["encoder_kwargs"]["link_fn"] = LINK_FUNCTIONS["softmax"]
+            model["encoder_kwargs"]["link_fn"] = LINK_FUNCTIONS["softmax"]
 
-        # Make regularizer
+        # Regularizer
         if "model_regularizer" in self.acceptable_kwargs["model"]:
-            if "alpha" in kwargs and kwargs["alpha"] > 0:
-                constructor_kwargs["model_regularizer"] = REGULARIZERS["l1_l2"](
+            if kwargs.get("alpha", 0) > 0:
+                model["model_regularizer"] = REGULARIZERS["l1_l2"](
                     kwargs["alpha"],
                     kwargs.get("l1_ratio", 1.0),
                     kwargs.get("mu_ratio", 0.5),
                 )
             else:
-                constructor_kwargs["model_regularizer"] = kwargs.get(
+                model["model_regularizer"] = kwargs.get(
                     "model_regularizer", REGULARIZERS["none"]
                 )
-        return constructor_kwargs
+        return model
 
-    def _split_train_data(self, C, X, Y=None, Y_required=False, **kwargs):
-        if "C_val" in kwargs:
-            if "X_val" in kwargs:
-                if Y_required and "Y_val" in kwargs:
-                    train_data = [C, X, Y]
-                    val_data = [kwargs["C_val"], X, kwargs["X_val"], Y, kwargs["Y_val"]]
-                    return train_data, val_data
-                print("Y_val not provided, not using the provided C_val or X_val.")
-            else:
-                print("X_val not provided, not using the provided C_val.")
-        if "val_split" in kwargs:
-            if 0 <= kwargs["val_split"] < 1:
-                val_split = kwargs["val_split"]
-            else:
-                print(
-                    """val_split={kwargs['val_split']} provided but should be between 0
-                    and 1 to indicate proportion of data to use as validation."""
-                )
-                raise ValueError
-        else:
-            val_split = self.default_val_split
-        if Y is None:
-            if val_split > 0:
-                C_train, C_val, X_train, X_val = train_test_split(
-                    C, X, test_size=val_split, shuffle=True
-                )
-            else:
-                C_train, X_train = C, X
-                C_val, X_val = C, X
-            train_data = [C_train, X_train]
-            val_data = [C_val, X_val]
-        else:
-            if val_split > 0:
-                C_train, C_val, X_train, X_val, Y_train, Y_val = train_test_split(
-                    C, X, Y, test_size=val_split, shuffle=True
-                )
-            else:
-                C_train, X_train, Y_train = C, X, Y
-                C_val, X_val, Y_val = C, X, Y
-            train_data = [C_train, X_train, Y_train]
-            val_data = [C_val, X_val, Y_val]
-        return train_data, val_data
-
-    def _build_dataloader(self, model, batch_size, *data):
-        """
-        Helper function to build a single dataloder.
-        Expects *args to contain whatever data (C,X,Y) is necessary for this model.
-        """
-        return model.dataloader(*data, batch_size=batch_size)
-
-    def _build_dataloaders(self, model, train_data, val_data, **kwargs):
-        """
-        :param model:
-        :param **kwargs:
-        """
-        train_dataloader = self._build_dataloader(
-            model,
-            kwargs.get("train_batch_size", self.default_train_batch_size),
-            *train_data,
-        )
-        if val_data is None:
-            val_dataloader = None
-        else:
-            val_dataloader = self._build_dataloader(
-                model,
-                kwargs.get("val_batch_size", self.default_val_batch_size),
-                *val_data,
+    # ---------- internal: sanitize callbacks when no val loop ----------
+    @staticmethod
+    def _retarget_or_strip_early_stopping(cb, use_val: bool, train_monitor="train_loss"):
+        try:
+            from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+        except Exception:
+            return cb
+        if not isinstance(cb, EarlyStopping):
+            return cb
+        if use_val:
+            return cb
+        # No val loop -> if monitoring val_* (or nothing), rebuild to watch train_loss
+        monitor = getattr(cb, "monitor", None)
+        if (monitor is None) or (isinstance(monitor, str) and monitor.startswith("val_")):
+            return EarlyStopping(
+                monitor=train_monitor,
+                mode=getattr(cb, "mode", "min"),
+                patience=getattr(cb, "patience", 1),
+                verbose=getattr(cb, "verbose", False),
+                min_delta=getattr(cb, "min_delta", 0.0),
             )
+        return cb
 
-        return train_dataloader, val_dataloader
+    # ---------- fit kwarg expansion (with DDP + ES logic) ----------
+    def _organize_and_expand_fit_kwargs(self, **kwargs):
+        organized, unrecognized = self._organize_kwargs(**kwargs)
+        # --- FORCE max_epochs to be set (avoid PL default=1000) ---
+        max_epochs_cli = kwargs.get("max_epochs", None)
+        epochs_cli     = kwargs.get("epochs", None)
+        if max_epochs_cli is not None:
+            organized["trainer"]["max_epochs"] = int(max_epochs_cli)
+        elif epochs_cli is not None:
+            organized["trainer"]["max_epochs"] = int(epochs_cli)
+        else:
+            organized["trainer"]["max_epochs"] = 3
 
+        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        use_val = organized["data"].get("val_split", DEFAULT_VAL_SPLIT) > 0.0
+
+        # Trainer base
+        organized["trainer"].setdefault("accelerator", self.accelerator)
+        organized["trainer"].setdefault("enable_progress_bar", False)
+        organized["trainer"].setdefault("logger", False)
+        organized["trainer"].setdefault("enable_checkpointing", False)
+        organized["trainer"].setdefault("num_sanity_val_steps", 0)
+        # conservative precision by default (TF32 is controlled globally)
+        organized["trainer"].setdefault("precision", 32)
+        if not use_val:
+            organized["trainer"].setdefault("limit_val_batches", 0)
+
+        if world_size > 1:
+            organized["trainer"].setdefault("devices", world_size)
+            strat = organized["trainer"].get("strategy", "auto")
+            if strat == "auto" or isinstance(strat, str):
+                organized["trainer"]["strategy"] = DDPStrategy(
+                    find_unused_parameters=False,
+                    static_graph=True,
+                    gradient_as_bucket_view=True,
+                )
+        else:
+            organized["trainer"]["devices"] = 1
+            organized["trainer"].setdefault("strategy", "auto")
+            organized["trainer"].setdefault("plugins", [LightningEnvironment()])
+
+        # Defaults: model/data
+        def maybe_add(cat, k, default):
+            if k in self.acceptable_kwargs[cat]:
+                organized[cat][k] = organized[cat].get(k, default)
+
+        # Model
+        maybe_add("model", "learning_rate", DEFAULT_LEARNING_RATE)
+        maybe_add("model", "context_dim", self.context_dim)
+        maybe_add("model", "x_dim", self.x_dim)
+        maybe_add("model", "y_dim", self.y_dim)
+        if organized["model"].get("num_archetypes", 1) == 0:
+            organized["model"].pop("num_archetypes", None)
+
+        # Data (GPU-friendly)
+        maybe_add("data", "train_batch_size", DEFAULT_TRAIN_BATCH_SIZE)
+        maybe_add("data", "val_batch_size", DEFAULT_VAL_BATCH_SIZE)
+        maybe_add("data", "test_batch_size", DEFAULT_TEST_BATCH_SIZE)
+        maybe_add("data", "num_workers", 0)
+        maybe_add("data", "pin_memory", (self.accelerator == "gpu"))
+        maybe_add("data", "persistent_workers", False)
+        maybe_add("data", "drop_last", False)
+        maybe_add("data", "shuffle_train", True)
+        maybe_add("data", "shuffle_eval", False)
+        maybe_add("data", "dtype", torch.float)
+
+        # Wrapper
+        maybe_add("wrapper", "n_bootstraps", DEFAULT_N_BOOTSTRAPS)
+
+        # Callbacks (EarlyStopping only if we validate; else watch train_loss)
+        es_monitor = organized["wrapper"].get("es_monitor", "val_loss" if use_val else "train_loss")
+        es_mode = organized["wrapper"].get("es_mode", "min")
+        es_patience = organized["wrapper"].get("es_patience", DEFAULT_ES_PATIENCE)
+        es_verbose = organized["wrapper"].get("es_verbose", False)
+        es_min_delta = organized["wrapper"].get("es_min_delta", 0.0)
+
+        callbacks_list = []
+        if use_val:
+            callbacks_list.append(
+                lambda i: EarlyStopping(
+                    monitor=es_monitor, mode=es_mode, patience=es_patience,
+                    verbose=es_verbose, min_delta=es_min_delta
+                )
+            )
+        if organized["trainer"].get("enable_checkpointing", False):
+            callbacks_list.append(
+                lambda i: ModelCheckpoint(
+                    monitor="val_loss" if use_val else None,
+                    dirpath=f"{kwargs.get('checkpoint_path', './lightning_logs')}/boot_{i}_checkpoints",
+                    filename="{epoch}-{val_loss:.4f}" if use_val else "{epoch}",
+                )
+            )
+        organized["trainer"].setdefault("callback_constructors", callbacks_list)
+
+        if unrecognized:
+            for kw in unrecognized:
+                print(f"Received unknown keyword argument {kw}, probably ignoring.")
+
+        # ---- merge constructor-time defaults as fallbacks ----
+        for category, cat_kwargs in self._init_kwargs.items():
+            for k, v in cat_kwargs.items():
+                organized[category].setdefault(k, v)
+
+        # ---- sanitize any pre-specified callbacks for no-val runs ----
+        # (handles both direct 'callbacks' and deferred 'callback_constructors')
+        cb_list = organized["trainer"].get("callbacks", [])
+        cb_list = [self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list]
+        organized["trainer"]["callbacks"] = cb_list
+
+        ctor_list = organized["trainer"].get("callback_constructors", [])
+        def _wrap_ctor(ctor):
+            def _wrapped(i):
+                cb = ctor(i)
+                return self._retarget_or_strip_early_stopping(cb, use_val)
+            return _wrapped
+        ctor_list = [_wrap_ctor(c) for c in ctor_list]
+        organized["trainer"]["callback_constructors"] = ctor_list
+
+        return organized
+
+    # ---------- data module builder ----------
+    def _build_datamodule(
+        self,
+        C: np.ndarray,
+        X: np.ndarray,
+        Y: Optional[np.ndarray],
+        *,
+        train_idx=None,
+        val_idx=None,
+        test_idx=None,
+        predict_idx=None,
+        data_kwargs: Optional[dict] = None,
+        task_type: str = "singletask_multivariate",
+    ) -> ContextualizedRegressionDataModule:
+        dk = dict(
+            batch_size=self.default_train_batch_size,
+            num_workers=0,
+            pin_memory=(self.accelerator == "gpu"),
+            persistent_workers=False,   # caller can override
+            drop_last=False,
+            shuffle_train=True,
+            shuffle_eval=False,
+            dtype=torch.float,
+        )
+        if data_kwargs:
+            dk.update(data_kwargs)
+
+        dm = ContextualizedRegressionDataModule(
+            C=C,
+            X=X,
+            Y=Y,
+            task_type=task_type,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            predict_idx=predict_idx,
+            batch_size=dk["batch_size"],
+            num_workers=dk["num_workers"],
+            pin_memory=dk["pin_memory"],
+            persistent_workers=dk["persistent_workers"],
+            drop_last=dk["drop_last"],
+            shuffle_train=dk["shuffle_train"],
+            shuffle_eval=dk["shuffle_eval"],
+            dtype=dk["dtype"],
+        )
+        dm.prepare_data()
+        dm.setup()
+        return dm
+
+    # ---------- split helper ----------
+    def _split_indices(self, n: int, val_split: float):
+        if val_split <= 0.0:
+            idx = np.arange(n)
+            return idx, None
+        tr_idx, va_idx = train_test_split(np.arange(n), test_size=val_split, shuffle=True)
+        return tr_idx, va_idx
+
+    # ---------- optional scaling ----------
     def _maybe_scale_C(self, C: np.ndarray) -> np.ndarray:
         if self.normalize and self.scalers["C"] is not None:
             return self.scalers["C"].transform(C)
@@ -412,47 +452,44 @@ class SKLearnWrapper:
             return self.scalers["X"].transform(X)
         return X
 
-    def predict(
-        self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
-    ) -> Union[np.ndarray, List[np.ndarray]]:
-        """Predict outcomes from context C and predictors X.
-
-        Args:
-            C (np.ndarray): Context array of shape (n_samples, n_context_features)
-            X (np.ndarray): Predictor array of shape (N, n_features)
-            individual_preds (bool, optional): Whether to return individual predictions for each model. Defaults to False.
-
-        Returns:
-            Union[np.ndarray, List[np.ndarray]]: The outcomes predicted by the context-specific models (n_samples, y_dim). Returned as lists of individual bootstraps if individual_preds is True.
-        """
+    # ---------- public API ----------
+    def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
         if not hasattr(self, "models") or self.models is None:
-            raise ValueError(
-                "Trying to predict with a model that hasn't been trained yet."
+            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
+
+        Cq = self._maybe_scale_C(C)
+        Xq = self._maybe_scale_X(X)
+        Yq = np.zeros((len(Cq), self.y_dim), dtype=np.float32)
+
+        preds = []
+        for i in range(len(self.models)):
+            dm = self._build_datamodule(
+                C=Cq, X=Xq, Y=Yq,
+                predict_idx=np.arange(len(Cq)),
+                data_kwargs=dict(
+                    batch_size=self._init_kwargs["data"].get("val_batch_size", DEFAULT_VAL_BATCH_SIZE),
+                    num_workers=self._init_kwargs["data"].get("num_workers", 0),
+                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
+                    persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
+                    shuffle_train=False,
+                    shuffle_eval=False,
+                    dtype=self._init_kwargs["data"].get("dtype", torch.float),
+                ),
+                task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
+                        else "singletask_multivariate",
             )
-        predictions = np.array(
-            [
-                self.trainers[i].predict_y(
-                    self.models[i],
-                    self.models[i].dataloader(
-                        self._maybe_scale_C(C),
-                        self._maybe_scale_X(X),
-                        np.zeros((len(C), self.y_dim)),
-                    ),
-                    **kwargs,
-                )
-                for i in range(len(self.models))
-            ]
-        )
-        if individual_preds:
-            preds = predictions
-        else:
-            preds = np.mean(predictions, axis=0)
+            yhat = self.trainers[i].predict_y(self.models[i], dm.predict_dataloader(), **kwargs)
+            preds.append(yhat)
+
+        predictions = np.array(preds)
+        if not individual_preds:
+            predictions = np.mean(predictions, axis=0)
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
-                preds = np.array([self.scalers["Y"].inverse_transform(p) for p in preds])
+                predictions = np.array([self.scalers["Y"].inverse_transform(p) for p in predictions])
             else:
-                preds = self.scalers["Y"].inverse_transform(preds)
-        return preds
+                predictions = self.scalers["Y"].inverse_transform(predictions)
+        return predictions
 
     def predict_params(
         self,
@@ -460,143 +497,152 @@ class SKLearnWrapper:
         individual_preds: bool = False,
         model_includes_mus: bool = True,
         **kwargs,
-    ) -> Union[
-        np.ndarray,
-        List[np.ndarray],
-        Tuple[np.ndarray, np.ndarray],
-        Tuple[List[np.ndarray], List[np.ndarray]],
-    ]:
-        """
-        Predict context-specific model parameters from context C.
+    ):
+        if not hasattr(self, "models") or self.models is None:
+            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
 
-        Args:
-            C (np.ndarray): Context array of shape (n_samples, n_context_features)
-            individual_preds (bool, optional): Whether to return individual model predictions for each bootstrap. Defaults to False, averaging across bootstraps.
-            model_includes_mus (bool, optional): Whether the model includes context-specific offsets (mu). Defaults to True.
+        Cq = self._maybe_scale_C(C)
+        X_zero = np.zeros((len(Cq), self.x_dim), dtype=np.float32)
+        Y_zero = np.zeros((len(Cq), self.y_dim), dtype=np.float32)
 
-        Returns:
-            Union[np.ndarray, List[np.ndarray], Tuple[np.ndarray, np.ndarray], Tuple[List[np.ndarray], List[np.ndarray]]: The parameters of the predicted context-specific models.
-            Returned as lists of individual bootstraps if individual_preds is True, otherwise averages the bootstraps for a better estimate.
-            If model_includes_mus is True, returns both coefficients and offsets as a tuple of (betas, mus). Otherwise, returns coefficients (betas) only.
-            For model_includes_mus=True, ([betas], [mus]) if individual_preds is True, otherwise (betas, mus).
-            For model_includes_mus=False, [betas] if individual_preds is True, otherwise betas.
-            betas is shape (n_samples, x_dim, y_dim) or (n_samples, x_dim) if y_dim = 1.
-            mus is shape (n_samples, y_dim) or (n_samples,) if y_dim = 1.
-        """
-        # Returns betas, mus
-        if kwargs.pop("uses_y", True):
-            get_dataloader = lambda i: self.models[i].dataloader(
-                self._maybe_scale_C(C),
-                np.zeros((len(C), self.x_dim)),
-                np.zeros((len(C), self.y_dim))
+        out_betas, out_mus = [], []
+        for i in range(len(self.models)):
+            dm = self._build_datamodule(
+                C=Cq,
+                X=X_zero,
+                Y=Y_zero if kwargs.pop("uses_y", True) else None,
+                predict_idx=np.arange(len(Cq)),
+                data_kwargs=dict(
+                    batch_size=self._init_kwargs["data"].get("val_batch_size", DEFAULT_VAL_BATCH_SIZE),
+                    num_workers=self._init_kwargs["data"].get("num_workers", 0),
+                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
+                    persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
+                    shuffle_train=False,
+                    shuffle_eval=False,
+                    dtype=self._init_kwargs["data"].get("dtype", torch.float),
+                ),
+                task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
+                        else "singletask_multivariate",
             )
-        else:
-            get_dataloader = lambda i: self.models[i].dataloader(
-                self._maybe_scale_C(C),
-                np.zeros((len(C), self.x_dim))
-            )
-        predictions = [
-            self.trainers[i].predict_params(self.models[i], get_dataloader(i), **kwargs)
-            for i in range(len(self.models))
-        ]
-        if model_includes_mus:
-            betas = np.array([p[0] for p in predictions])
-            mus = np.array([p[1] for p in predictions])
-            if individual_preds:
-                return betas, mus
+            pred = self.trainers[i].predict_params(self.models[i], dm.predict_dataloader(), **kwargs)
+            if model_includes_mus:
+                out_betas.append(pred[0]); out_mus.append(pred[1])
             else:
-                return np.mean(betas, axis=0), np.mean(mus, axis=0)
-        betas = np.array(predictions)
-        if not individual_preds:
-            return np.mean(betas, axis=0)
-        return betas
+                out_betas.append(pred)
+
+        if model_includes_mus:
+            betas = np.array(out_betas); mus = np.array(out_mus)
+            return (betas, mus) if individual_preds else (np.mean(betas, axis=0), np.mean(mus, axis=0))
+        else:
+            betas = np.array(out_betas)
+            return betas if individual_preds else np.mean(betas, axis=0)
 
     def fit(self, *args, **kwargs) -> None:
         """
         Fit contextualized model to data.
-
         Args:
-            C (np.ndarray): Context array of shape (n_samples, n_context_features)
-            X (np.ndarray): Predictor array of shape (N, n_features)
-            Y (np.ndarray, optional): Target array of shape (N, n_targets). Defaults to None, where X will be used as targets such as in Contextualized Networks.
-            max_epochs (int, optional): Maximum number of epochs to train for. Defaults to 1.
-            learning_rate (float, optional): Learning rate for optimizer. Defaults to 1e-3.
-            val_split (float, optional): Proportion of data to use for validation and early stopping. Defaults to 0.2.
-            n_bootstraps (int, optional): Number of bootstraps to use. Defaults to 1.
-            train_batch_size (int, optional): Batch size for training. Defaults to 1.
-            val_batch_size (int, optional): Batch size for validation. Defaults to 16.
-            test_batch_size (int, optional): Batch size for testing. Defaults to 16.
-            es_patience (int, optional): Number of epochs to wait before early stopping. Defaults to 1.
-            es_monitor (str, optional): Metric to monitor for early stopping. Defaults to "val_loss".
-            es_mode (str, optional): Mode for early stopping. Defaults to "min".
-            es_verbose (bool, optional): Whether to print early stopping updates. Defaults to False.
+            C (np.ndarray): (n, c_dim)
+            X (np.ndarray): (n, x_dim)
+            Y (np.ndarray, optional): (n, y_dim)
         """
-        self.models = []
-        self.trainers = []
-        self.dataloaders = {"train": [], "val": [], "test": []}
+        self.models, self.trainers = [], []
+
         C, X = args[0], args[1]
         if self.normalize:
-            if self.scalers["C"] is None:
-                self.scalers["C"] = StandardScaler().fit(C)
+            if self.scalers["C"] is None: self.scalers["C"] = StandardScaler().fit(C)
             C = self.scalers["C"].transform(C)
-            if self.scalers["X"] is None:
-                self.scalers["X"] = StandardScaler().fit(X)
+            if self.scalers["X"] is None: self.scalers["X"] = StandardScaler().fit(X)
             X = self.scalers["X"].transform(X)
-        self.context_dim = C.shape[-1]
-        self.x_dim = X.shape[-1]
+        self.context_dim = C.shape[-1]; self.x_dim = X.shape[-1]
+
         if len(args) == 3:
             Y = args[2]
-            if kwargs.get("Y", None) is not None:
-                Y = kwargs.get("Y")
-            if len(Y.shape) == 1:  # add feature dimension to Y if not given.
-                Y = np.expand_dims(Y, 1)
+            if kwargs.get("Y", None) is not None: Y = kwargs.get("Y")
+            if len(Y.shape) == 1: Y = np.expand_dims(Y, 1)
             if self.normalize and not np.array_equal(np.unique(Y), np.array([0, 1])):
-                if self.scalers["Y"] is None:
-                    self.scalers["Y"] = StandardScaler().fit(Y)
+                if self.scalers["Y"] is None: self.scalers["Y"] = StandardScaler().fit(Y)
                 Y = self.scalers["Y"].transform(Y)
             self.y_dim = Y.shape[-1]
             args = (C, X, Y)
         else:
             self.y_dim = self.x_dim
             args = (C, X)
-        organized_kwargs = self._organize_and_expand_fit_kwargs(**kwargs)
-        self.n_bootstraps = organized_kwargs["wrapper"].get(
-            "n_bootstraps", self.n_bootstraps
-        )
-        for bootstrap in range(self.n_bootstraps):
-            model = self.base_constructor(**organized_kwargs["model"])
-            train_data, val_data = self._split_train_data(
-                *args, **organized_kwargs["data"]
+
+        organized = self._organize_and_expand_fit_kwargs(**kwargs)
+        self.n_bootstraps = organized["wrapper"].get("n_bootstraps", self.n_bootstraps)
+
+        n = C.shape[0]
+        val_split = organized["data"].get("val_split", DEFAULT_VAL_SPLIT)
+        use_val = val_split > 0.0
+
+        for b in range(self.n_bootstraps):
+            # Build model (LightningModule)
+            _model_kwargs = dict(organized["model"])
+            _model_kwargs.pop("univariate", None)
+            model = self.base_constructor(**_model_kwargs)
+            self.model_ = model
+
+            # Indices
+            train_idx, val_idx = self._split_indices(n, val_split)
+            test_idx = None
+
+            # DataModule
+            task_type = "singletask_univariate" if organized["model"].get("univariate", False) else "singletask_multivariate"
+            dm = self._build_datamodule(
+                C=args[0], X=args[1], Y=(args[2] if len(args) == 3 else None),
+                train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+                data_kwargs=dict(
+                    batch_size=organized["data"].get("train_batch_size", DEFAULT_TRAIN_BATCH_SIZE),
+                    num_workers=organized["data"].get("num_workers", 0),
+                    pin_memory=organized["data"].get("pin_memory", (self.accelerator == "gpu")),
+                    persistent_workers=organized["data"].get("persistent_workers", False),
+                    drop_last=organized["data"].get("drop_last", False),
+                    shuffle_train=organized["data"].get("shuffle_train", True),
+                    shuffle_eval=organized["data"].get("shuffle_eval", False),
+                    dtype=organized["data"].get("dtype", torch.float),
+                ),
+                task_type=task_type,
             )
-            train_dataloader, val_dataloader = self._build_dataloaders(
-                model,
-                train_data,
-                val_data,
-                **organized_kwargs["data"],
+
+            # Trainer (fresh callbacks)
+            trainer_kwargs = copy.deepcopy(organized["trainer"])
+            trainer_kwargs["callbacks"] = [f(b) for f in trainer_kwargs.get("callback_constructors", [])]
+            trainer_kwargs.pop("callback_constructors", None)
+
+            # Build via factory (handles env quirks)
+            from contextualized.regression.trainers import make_trainer_with_env
+            trainer = make_trainer_with_env(
+                self.trainer_constructor,
+                **trainer_kwargs,
             )
-            # Makes a new trainer for each bootstrap fit - bad practice, but necessary here.
-            my_trainer_kwargs = copy.deepcopy(organized_kwargs["trainer"])
-            # Must reconstruct the callbacks because they save state from fitting trajectories.
-            my_trainer_kwargs["callbacks"] = [
-                f(bootstrap)
-                for f in organized_kwargs["trainer"]["callback_constructors"]
-            ]
-            del my_trainer_kwargs["callback_constructors"]
-            trainer = self.trainer_constructor(
-                **my_trainer_kwargs, enable_progress_bar=False
-            )
-            checkpoint_callback = my_trainer_kwargs["callbacks"][1]
-            os.makedirs(checkpoint_callback.dirpath, exist_ok=True)
-            try:
+
+            # Ensure checkpoint dir if used
+            for cb in trainer_kwargs.get("callbacks", []):
+                if isinstance(cb, ModelCheckpoint):
+                    os.makedirs(cb.dirpath, exist_ok=True)
+
+            # Fit (don’t pass val loader if no val split)
+            if use_val and dm.val_dataloader() is not None:
                 trainer.fit(
-                    model, train_dataloader, val_dataloader, **organized_kwargs["fit"]
+                    model,
+                    train_dataloaders=dm.train_dataloader(),
+                    val_dataloaders=dm.val_dataloader(),
+                    **organized["fit"],
                 )
-            except:
-                trainer.fit(model, train_dataloader, **organized_kwargs["fit"])
-            if kwargs.get("max_epochs", 1) > 0:
-                best_checkpoint = torch.load(checkpoint_callback.best_model_path)
-                model.load_state_dict(best_checkpoint["state_dict"])
-            self.dataloaders["train"].append(train_dataloader)
-            self.dataloaders["val"].append(val_dataloader)
+            else:
+                trainer.fit(
+                    model,
+                    train_dataloaders=dm.train_dataloader(),
+                    **organized["fit"],
+                )
+
+            # (Optional) load best ckpt if checkpointing enabled
+            max_epochs = trainer_kwargs.get("max_epochs", 1)
+            if max_epochs and trainer_kwargs.get("enable_checkpointing", False):
+                ckpt_cb = next((cb for cb in trainer.callbacks if isinstance(cb, ModelCheckpoint)), None)
+                if ckpt_cb and ckpt_cb.best_model_path and os.path.exists(ckpt_cb.best_model_path):
+                    best = torch.load(ckpt_cb.best_model_path, map_location="cpu")
+                    model.load_state_dict(best["state_dict"])
+
             self.models.append(model)
             self.trainers.append(trainer)

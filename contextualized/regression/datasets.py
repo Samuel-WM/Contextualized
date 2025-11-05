@@ -12,9 +12,9 @@ class MultivariateDataset(Dataset):
     Simple multivariate dataset with context, predictors, and outcomes.
     """
     def __init__(self, C, X, Y, dtype=torch.float):
-        self.C = torch.tensor(C, dtype=dtype)
-        self.X = torch.tensor(X, dtype=dtype)
-        self.Y = torch.tensor(Y, dtype=dtype)
+        self.C = torch.as_tensor(C, dtype=dtype)
+        self.X = torch.as_tensor(X, dtype=dtype)
+        self.Y = torch.as_tensor(Y, dtype=dtype)
         self.c_dim = C.shape[-1]
         self.x_dim = X.shape[-1]
         self.y_dim = Y.shape[-1]
@@ -37,9 +37,9 @@ class UnivariateDataset(Dataset):
     Simple univariate dataset with context, predictors, and one outcome.
     """
     def __init__(self, C, X, Y, dtype=torch.float):
-        self.C = torch.tensor(C, dtype=dtype)
-        self.X = torch.tensor(X, dtype=dtype)
-        self.Y = torch.tensor(Y, dtype=dtype)
+        self.C = torch.as_tensor(C, dtype=dtype)
+        self.X = torch.as_tensor(X, dtype=dtype)
+        self.Y = torch.as_tensor(Y, dtype=dtype)
         self.c_dim = C.shape[-1]
         self.x_dim = X.shape[-1]
         self.y_dim = Y.shape[-1]
@@ -118,9 +118,9 @@ class MultitaskUnivariateDataset(Dataset):
     Splits each sample into univariate X and Y feature pairs for univariate regression tasks.
     """ 
     def __init__(self, C, X, Y, dtype=torch.float):
-        self.C = torch.tensor(C, dtype=dtype)
-        self.X = torch.tensor(X, dtype=dtype)
-        self.Y = torch.tensor(Y, dtype=dtype)
+        self.C = torch.as_tensor(C, dtype=dtype)
+        self.X = torch.as_tensor(X, dtype=dtype)
+        self.Y = torch.as_tensor(Y, dtype=dtype)
         self.c_dim = C.shape[-1]
         self.x_dim = X.shape[-1]
         self.y_dim = Y.shape[-1]

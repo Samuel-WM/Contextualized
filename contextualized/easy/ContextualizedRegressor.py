@@ -7,10 +7,7 @@ from contextualized.regression import (
     ContextualizedRegression,
 )
 from contextualized.easy.wrappers import SKLearnWrapper
-from contextualized.regression import RegressionTrainer
-
-# TODO: Multitask metamodels
-# TODO: Task-specific link functions.
+from contextualized.regression.trainers import RegressionTrainer  # <-- updated import
 
 
 class ContextualizedRegressor(SKLearnWrapper):
@@ -41,9 +38,11 @@ class ContextualizedRegressor(SKLearnWrapper):
                 archetypes, but this should be a non-negative integer."""
             )
 
+        # Wrapper will accept these; no need to expose DataModule specifics here.
         extra_model_kwargs = ["base_param_predictor", "base_y_predictor", "y_dim"]
         extra_data_kwargs = ["Y_val"]
         trainer_constructor = RegressionTrainer
+
         super().__init__(
             constructor,
             extra_model_kwargs,
@@ -52,5 +51,6 @@ class ContextualizedRegressor(SKLearnWrapper):
             **kwargs,
         )
 
+    # Preserve legacy behavior that Y is expected/required for regression fits
     def _split_train_data(self, C, X, Y=None, Y_required=False, **kwargs):
         return super()._split_train_data(C, X, Y, Y_required=True, **kwargs)

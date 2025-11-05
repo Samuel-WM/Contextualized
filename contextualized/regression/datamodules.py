@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-import lightning as pl
+import pytorch_lightning as pl
 
 from .datasets import (
     MultivariateDataset,
@@ -159,15 +159,15 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             X_s = _maybe_index(X, idx)
             Y_s = None if (Y is None) else _maybe_index(Y, idx)
             ds_cls = TASK_TO_DATASET[self.task_type]
-            # Y can be optional for some tasks; the dataset constructors you showed
-            # expect Y. If a task doesn't use Y, pass a placeholder or ensure callers pass X as Y when needed.
+
             if Y_s is None:
-                # If Y is truly not used for this task_type, construct a compatible placeholder.
-                # Here we create zeros with appropriate last dim to match dataset expectations.
-                # For singletask_univariate/multivariate we assume Y has shape (n, y_dim).
-                # Override as needed if your upstream code guarantees a Y.
-                Y_s = torch.zeros((C_s.shape[0], X_s.shape[-1]), dtype=self.dtype)
+                raise ValueError(
+                    f"Y is required for regression task_type='{self.task_type}'. "
+                    "Pass a real Y array matching your task."
+                )
+
             return ds_cls(C_s, X_s, Y_s, dtype=self.dtype)
+
 
         self.ds_train = _mk_dataset(self.train_idx)
         self.ds_val = _mk_dataset(self.val_idx)
@@ -196,14 +196,15 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             **self._common_dl_kwargs(),
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self):
         if self.ds_val is None:
-            raise RuntimeError("val dataset is not set; provide val_idx or splitter.")
+            return None
         return DataLoader(
             dataset=self.ds_val,
-            shuffle=self.shuffle_eval,   # False by default
+            shuffle=self.shuffle_eval,
             **self._common_dl_kwargs(),
         )
+
 
     def test_dataloader(self) -> DataLoader:
         if self.ds_test is None:
