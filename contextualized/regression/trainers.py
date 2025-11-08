@@ -83,6 +83,7 @@ class RegressionTrainer(pl.Trainer):
             # If betas is (B, y, x) but X is (B, y, x, 1), add trailing singleton to betas
             if betas.dim() == 3 and X.dim() == 4 and betas.size(-1) == X.size(-2):
                 betas = betas.unsqueeze(-1)
+                
 
             # Ensure mus trailing dim is singleton
             if mus.dim() == 2:               # (B, y)

@@ -275,9 +275,16 @@ class SKLearnWrapper:
 
     # -------------------- fit kwarg expansion --------------------
     def _organize_and_expand_fit_kwargs(self, **kwargs):
+        """
+        Expand/normalize kwargs for data/model/trainer/wrapper/fit, and build a clean
+        configuration dict for downstream construction. Critically:
+        • Merge constructor-time defaults BEFORE computing use_val.
+        • Only add EarlyStopping if a val loop exists and patience > 0.
+        • Retarget or strip EarlyStopping if no val loop.
+        """
         organized, unrecognized = self._organize_kwargs(**kwargs)
 
-        # Max epochs (avoid PL default 1000)
+        # -------- epochs (avoid PL default 1000) --------
         max_epochs_cli = kwargs.get("max_epochs", None)
         epochs_cli = kwargs.get("epochs", None)
         if max_epochs_cli is not None:
@@ -287,10 +294,18 @@ class SKLearnWrapper:
         else:
             organized["trainer"]["max_epochs"] = 3
 
-        world_size = int(os.getenv("WORLD_SIZE", "1"))
-        use_val = organized["data"].get("val_split", self.default_val_split) > 0.0
+        # -------- merge constructor defaults BEFORE using them --------
+        for category, cat_kwargs in self._init_kwargs.items():
+            for k, v in cat_kwargs.items():
+                organized[category].setdefault(k, v)
 
-        # Trainer defaults
+        # -------- world size / validation decision --------
+        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        current_val_split = organized["data"].get("val_split", self.default_val_split)
+        organized["data"]["val_split"] = current_val_split
+        use_val = float(current_val_split) > 0.0
+
+        # -------- trainer defaults --------
         organized["trainer"].setdefault("accelerator", self.accelerator)
         organized["trainer"].setdefault("enable_progress_bar", False)
         organized["trainer"].setdefault("logger", False)
@@ -302,18 +317,18 @@ class SKLearnWrapper:
 
         if world_size > 1:
             organized["trainer"].setdefault("devices", world_size)
-            # Defer concrete object; prefer plain string for factory
-            organized["trainer"].setdefault("strategy", "ddp")
+            organized["trainer"].setdefault("strategy", "ddp")  # string to allow factory
         else:
             organized["trainer"]["devices"] = 1
             organized["trainer"].setdefault("strategy", "auto")
             organized["trainer"].setdefault("plugins", [LightningEnvironment()])
 
-        # Model defaults
+        # Helper to safely set defaults if the key is permitted for that category
         def maybe_add(cat, k, default):
             if k in self.acceptable_kwargs[cat]:
                 organized[cat][k] = organized[cat].get(k, default)
 
+        # -------- model defaults --------
         maybe_add("model", "learning_rate", self.default_learning_rate)
         maybe_add("model", "context_dim", self.context_dim)
         maybe_add("model", "x_dim", self.x_dim)
@@ -321,7 +336,7 @@ class SKLearnWrapper:
         if organized["model"].get("num_archetypes", 1) == 0:
             organized["model"].pop("num_archetypes", None)
 
-        # Data defaults (per-loader sizes)
+        # -------- data defaults (per-loader sizes) --------
         maybe_add("data", "train_batch_size", self.default_train_batch_size)
         maybe_add("data", "val_batch_size", self.default_val_batch_size)
         maybe_add("data", "test_batch_size", self.default_test_batch_size)
@@ -334,10 +349,10 @@ class SKLearnWrapper:
         maybe_add("data", "shuffle_eval", False)
         maybe_add("data", "dtype", torch.float)
 
-        # Wrapper defaults
+        # -------- wrapper defaults --------
         maybe_add("wrapper", "n_bootstraps", self.default_n_bootstraps)
 
-        # EarlyStopping/Checkpoint constructors (sanitized later if no val)
+        # -------- EarlyStopping / Checkpoint constructors --------
         es_monitor = organized["wrapper"].get("es_monitor", "val_loss" if use_val else "train_loss")
         es_mode = organized["wrapper"].get("es_mode", "min")
         es_patience = organized["wrapper"].get("es_patience", self.default_es_patience)
@@ -345,36 +360,39 @@ class SKLearnWrapper:
         es_min_delta = organized["wrapper"].get("es_min_delta", 0.0)
 
         cb_ctors = organized["trainer"].get("callback_constructors", [])
-        if use_val:
+
+        # Only add EarlyStopping when there is a val loop AND patience > 0
+        if use_val and (es_patience is not None and es_patience > 0):
             cb_ctors.append(
                 lambda i: EarlyStopping(
-                    monitor=es_monitor, mode=es_mode, patience=es_patience,
-                    verbose=es_verbose, min_delta=es_min_delta
+                    monitor=es_monitor,
+                    mode=es_mode,
+                    patience=es_patience,
+                    verbose=es_verbose,
+                    min_delta=es_min_delta,
                 )
             )
+
         if organized["trainer"].get("enable_checkpointing", False):
             cb_ctors.append(
                 lambda i: ModelCheckpoint(
-                    monitor="val_loss" if use_val else None,
+                    monitor=("val_loss" if use_val else None),
                     dirpath=f"{kwargs.get('checkpoint_path', './lightning_logs')}/boot_{i}_checkpoints",
-                    filename="{epoch}-{val_loss:.4f}" if use_val else "{epoch}",
+                    filename=("{epoch}-{val_loss:.4f}" if use_val else "{epoch}"),
                 )
             )
         organized["trainer"]["callback_constructors"] = cb_ctors
 
+        # -------- unknown kw logging --------
         for kw in unrecognized:
             print(f"Received unknown keyword argument {kw}, probably ignoring.")
 
-        # Merge __init__ defaults as fallbacks
-        for category, cat_kwargs in self._init_kwargs.items():
-            for k, v in cat_kwargs.items():
-                organized[category].setdefault(k, v)
-
-        # Sanitize any pre-specified callbacks for no-val runs
+        # -------- sanitize any pre-specified callbacks for no-val runs --------
         cb_list = organized["trainer"].get("callbacks", [])
         cb_list = [self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list]
         organized["trainer"]["callbacks"] = cb_list
 
+        # Also sanitize dynamically constructed callbacks
         ctor_list = organized["trainer"].get("callback_constructors", [])
         def _wrap_ctor(ctor):
             def _wrapped(i):
@@ -384,6 +402,7 @@ class SKLearnWrapper:
         organized["trainer"]["callback_constructors"] = [_wrap_ctor(c) for c in ctor_list]
 
         return organized
+
 
     # -------------------- data module builder --------------------
     def _build_datamodule(
