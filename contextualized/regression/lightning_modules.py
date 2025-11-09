@@ -276,14 +276,9 @@ class ContextualizedRegressionBase(pl.LightningModule):
         return loss
 
     def _predict_from_models(self, X, beta_hat, mu_hat):
-        """
+        # fused reduction + keepdim avoids extra unsqueeze
+        return self.link_fn((beta_hat * X).sum(dim=-1, keepdim=True) + mu_hat)
 
-        :param X:
-        :param beta_hat:
-        :param mu_hat:
-
-        """
-        return self.link_fn((beta_hat * X).sum(axis=-1).unsqueeze(-1) + mu_hat)
 
     def _predict_y(self, C, X, beta_hat, mu_hat):
         """
@@ -418,6 +413,8 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         base_param_predictor=None,
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
         self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
@@ -473,7 +470,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         beta_hat, mu_hat = self(batch)
         batch.update({
             "betas": beta_hat,
-            "mus": mu_hat.squeeze(-1),
+            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
         })
         return batch
 
@@ -558,6 +555,8 @@ class NaiveContextualizedRegression(ContextualizedRegression):
             base_y_predictor=base_y_predictor,
             base_param_predictor=base_param_predictor
         )
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
 
 
 class MultitaskContextualizedRegression(ContextualizedRegressionBase):
@@ -581,6 +580,8 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
         model_regularizer="none",
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
         self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
@@ -636,18 +637,11 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
         return Y
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """ 
         beta_hat, mu_hat = self(batch)
         batch.update({
             "betas": beta_hat,
-            "mus": mu_hat.squeeze(-1),
+            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
         })
-         # Return batch with predictions
         return batch
 
 
@@ -723,6 +717,8 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
         model_regularizer="none",
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.learning_rate = learning_rate
         self.metamodel_type = metamodel_type
         self.fit_intercept = fit_intercept
@@ -782,19 +778,13 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
         return Y
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """ 
         beta_hat, mu_hat = self(batch)
         batch.update({
             "betas": beta_hat,
-            "mus": mu_hat.squeeze(-1),
+            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
         })
-         # Return batch with predictions
         return batch
+
 
     # def _batch_loss(self, batch, batch_idx):
     #     """
@@ -888,6 +878,8 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         base_param_predictor=None,
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
         self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
@@ -954,8 +946,8 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         """
         beta_hat, mu_hat = self(batch)
         batch.update({
-            "betas": beta_hat.squeeze(-1),
-            "mus": mu_hat.squeeze(-1),
+            "betas": beta_hat,  # keep last dim; downstream handles shape uniformly
+            "mus":   mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
         })
         return batch
 
@@ -1023,6 +1015,8 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
         model_regularizer="none",
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
         self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
@@ -1078,18 +1072,13 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
         return Y
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """ 
         beta_hat, mu_hat = self(batch)
         batch.update({
-            "betas": beta_hat.squeeze(-1),
-            "mus": mu_hat.squeeze(-1),
+            "betas": beta_hat,  # keep last dim
+            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
         })
         return batch
+
 
 class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
     """See TasksplitMetamodel"""
@@ -1120,6 +1109,8 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
         model_regularizer="none",
     ):
         super().__init__()
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.learning_rate = learning_rate
         self.fit_intercept = fit_intercept
         self.link_fn = _resolve_registry_or_callable(link_fn, LINK_FUNCTIONS, "link_fn")
@@ -1178,18 +1169,13 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
         return Y
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """ 
         beta_hat, mu_hat = self(batch)
         batch.update({
-            "betas": beta_hat.squeeze(-1),
-            "mus": mu_hat.squeeze(-1),
+            "betas": beta_hat,  # keep last dim
+            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
         })
         return batch
+
 
     # def _params_reshape(self, preds, dataloader):
     #     """
@@ -1246,6 +1232,8 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
         if "y_dim" in kwargs:
             del kwargs["y_dim"]
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
@@ -1255,11 +1243,12 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
         signs[signs != signs.transpose(1, 2)] = 0
         correlations = signs * torch.sqrt(torch.abs(beta_hat * beta_hat_T))
         batch.update({
-            "betas": beta_hat,                        # already squeezed
-            "mus": mu_hat.squeeze(-1),
+            "betas": beta_hat,
+            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
             "correlations": correlations,
         })
         return batch
+
 
 
 
@@ -1274,6 +1263,8 @@ class MultitaskContextualizedCorrelation(MultitaskContextualizedUnivariateRegres
         if "y_dim" in kwargs:
             del kwargs["y_dim"]
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
 
 
 class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegression):
@@ -1287,6 +1278,8 @@ class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegres
         if "y_dim" in kwargs:
             del kwargs["y_dim"]
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
 
 
 class ContextualizedNeighborhoodSelection(ContextualizedRegression):
@@ -1309,6 +1302,8 @@ class ContextualizedNeighborhoodSelection(ContextualizedRegression):
         super().__init__(
             context_dim, x_dim, x_dim, model_regularizer=model_regularizer, **kwargs
         )
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
@@ -1336,6 +1331,8 @@ class ContextualizedMarkovGraph(ContextualizedRegression):
         if "y_dim" in kwargs:
             del kwargs["y_dim"]
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
+        self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
+
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):

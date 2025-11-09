@@ -1,5 +1,5 @@
 import torch
-from lightning import LightningDataModule
+from pytorch_lightning import LightningDataModule
 from contextualized.regression.datasets import MultivariateDataset, UnivariateDataset, MultitaskMultivariateDataset, MultitaskUnivariateDataset
 from sklearn.model_selection import train_test_split
 

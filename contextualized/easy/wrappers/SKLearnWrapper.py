@@ -77,7 +77,7 @@ class SKLearnWrapper:
         self.context_dim = None
         self.x_dim = None
         self.y_dim = None
-        self.accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+        self.accelerator = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Accepted kwarg routes
         self.acceptable_kwargs = {
@@ -342,7 +342,7 @@ class SKLearnWrapper:
         maybe_add("data", "test_batch_size", self.default_test_batch_size)
         maybe_add("data", "predict_batch_size", self.default_val_batch_size)
         maybe_add("data", "num_workers", 0)
-        maybe_add("data", "pin_memory", (self.accelerator == "gpu"))
+        maybe_add("data", "pin_memory", self.accelerator in ("cuda", "gpu"))
         maybe_add("data", "persistent_workers", False)
         maybe_add("data", "drop_last", False)
         maybe_add("data", "shuffle_train", True)
@@ -403,7 +403,6 @@ class SKLearnWrapper:
 
         return organized
 
-
     # -------------------- data module builder --------------------
     def _build_datamodule(
         self,
@@ -424,7 +423,7 @@ class SKLearnWrapper:
             test_batch_size=self.default_test_batch_size,
             predict_batch_size=self.default_val_batch_size,
             num_workers=0,
-            pin_memory=(self.accelerator == "gpu"),
+            pin_memory=(self.accelerator in ("cuda", "gpu")),
             persistent_workers=False,
             drop_last=False,
             shuffle_train=True,
@@ -521,7 +520,7 @@ class SKLearnWrapper:
                     test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
                     predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
+                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
                     persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
                     shuffle_train=False,
                     shuffle_eval=False,
@@ -570,7 +569,7 @@ class SKLearnWrapper:
                     test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
                     predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
+                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
                     persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
                     shuffle_train=False,
                     shuffle_eval=False,
@@ -684,7 +683,7 @@ class SKLearnWrapper:
                     test_batch_size=organized["data"].get("test_batch_size", self.default_test_batch_size),
                     predict_batch_size=organized["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=organized["data"].get("num_workers", 0),
-                    pin_memory=organized["data"].get("pin_memory", (self.accelerator == "gpu")),
+                    pin_memory=organized["data"].get("pin_memory", self.accelerator in ("cuda", "gpu")),
                     persistent_workers=organized["data"].get("persistent_workers", False),
                     drop_last=organized["data"].get("drop_last", False),
                     shuffle_train=organized["data"].get("shuffle_train", True),

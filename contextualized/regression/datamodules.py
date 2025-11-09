@@ -31,8 +31,9 @@ def _to_tensor(x: TensorLike, dtype: torch.dtype) -> torch.Tensor:
         return x.to(dtype=dtype, copy=False)
     if isinstance(x, (pd.DataFrame, pd.Series)):
         x = x.to_numpy(copy=False)
-    # x is now np.ndarray or array-like
-    return torch.tensor(x, dtype=dtype)
+    # np.ndarray -> avoid copy where possible
+    return torch.as_tensor(x, dtype=dtype)
+
 
 
 def _maybe_index(x: torch.Tensor, idx: IndexLike) -> torch.Tensor:
@@ -191,9 +192,10 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             "batch_size": batch_size,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
-            "persistent_workers": self.persistent_workers,
+            "persistent_workers": bool(self.num_workers > 0 and self.persistent_workers),
             "drop_last": self.drop_last,
         }
+
 
 
     def train_dataloader(self) -> DataLoader:

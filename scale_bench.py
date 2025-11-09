@@ -1,240 +1,109 @@
 #!/usr/bin/env python3
-# scale_bench.py
 """
-Scalability benchmark for Contextualized-ML (single-node, Lambda GPU instance).
+Sweep benchmark for Contextualized-ML scaling.
 
-Runs 4 configs with a FIXED GLOBAL BATCH SIZE:
-  - 1 CPU
-  - 1 GPU
-  - 2 GPUs (DDP)
-  - 4 GPUs (DDP)
-
+Runs: CPU, 1-GPU, 2-GPU, 3-GPU, 4-GPU (skips if not available).
 Outputs:
-  - results/bench_results.csv
-  - results/scaling_samples_per_sec.png
-  - results/scaling_wallclock.png
-  - results/scaling_epoch_time.png
-  - results/scaling_convergence_time.png
-
-Requirements:
-  - Your package importable on the instance.
-  - PyTorch + Lightning working w/ CUDA.
+  - bench_out/scale_results.csv
+  - bench_out/throughput_vs_devices.png
+  - bench_out/walltime_vs_devices.png
+  - bench_out/epoch_time_vs_devices.png
 """
 
-from __future__ import annotations
-import argparse, json, math, os, sys, time, subprocess, shutil, uuid, signal
-from dataclasses import dataclass, asdict
+import os, time, argparse, csv, math
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-
 import numpy as np
 import torch
-
-# ---- Your package imports (as provided) ----
-from contextualized.regression.trainers import RegressionTrainer, make_trainer_with_env
-from contextualized.regression.models import ContextualizedRegression   # adjust path if different
-from contextualized.regression.datamodules import ContextualizedRegressionDataModule
-
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
-
-import matplotlib
-matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
+from contextualized.regression.datamodules import ContextualizedRegressionDataModule
+from contextualized.regression import ContextualizedRegression
+from contextualized.regression.trainers import RegressionTrainer, make_trainer_with_env
+from pytorch_lightning.callbacks import Callback
 
-# =========================
-# Synthetic data generator
-# =========================
-def make_synth(n=200_000, c_dim=16, x_dim=64, y_dim=1, noise=0.10, seed=123):
-    """
-    Multivariate regression with context-conditioned parameters:
-      Y = g( beta(C)*X + mu(C) ) + noise
-    g = identity (MSE)
-    """
-    rng = np.random.default_rng(seed)
-    C = rng.normal(size=(n, c_dim)).astype(np.float32)
-    X = rng.normal(size=(n, x_dim)).astype(np.float32)
+# ----------------- utils -----------------
+def env_defaults():
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
-    # Context-conditioned weights: low-rank projection from C -> (y_dim, x_dim) and mu
-    Wc = rng.normal(scale=0.5, size=(c_dim, y_dim * x_dim)).astype(np.float32)
-    Wm = rng.normal(scale=0.5, size=(c_dim, y_dim)).astype(np.float32)
-
-    beta_flat = C @ Wc                       # (n, y_dim*x_dim)
-    beta = beta_flat.reshape(n, y_dim, x_dim)
-    mu   = (C @ Wm).reshape(n, y_dim, 1)     # (n, y_dim, 1)
-
-    # Broadcast X to (n, y_dim, x_dim) for multivariate form
-    Xb = np.expand_dims(X, 1).repeat(y_dim, axis=1)
-    y_true = (beta * Xb).sum(axis=-1, keepdims=True) + mu   # (n, y_dim, 1)
-
-    Y = y_true + noise * rng.normal(size=y_true.shape).astype(np.float32)
-    Y = Y.squeeze(-1)  # (n, y_dim)
+def make_synth(n, c_dim, x_dim, y_dim, seed=1337):
+    rng = np.random.RandomState(seed)
+    C = rng.randn(n, c_dim).astype("float32")
+    X = rng.randn(n, x_dim).astype("float32")
+    W = rng.randn(y_dim, x_dim).astype("float32")
+    b = rng.randn(y_dim, 1).astype("float32")
+    Y = (X @ W.T + b.squeeze(-1) + 0.05 * rng.randn(n, y_dim)).astype("float32")
     return C, X, Y
 
+class TimingCallback(Callback):
+    """Collect per-epoch timings and global wall time."""
+    def __init__(self):
+        self.epoch_times = []
+        self._t_epoch = None
+        self._t0 = None
+        self._t1 = None
 
-# =========================
-# Metrics callback
-# =========================
-class MetricsCallback(Callback):
-    """
-    Collect:
-      - wall-clock time
-      - per-epoch time (avg)
-      - total epochs
-      - samples/sec (global)
-      - convergence time & steps (val_loss <= target; or train_loss if no val)
-      - max memory (GPU or CPU)
-    Only rank 0 logs final metrics in DDP.
-    """
-    def __init__(self, global_batch_size: int, train_size: int, target_loss: float, use_val: bool):
-        super().__init__()
-        self.global_batch = global_batch_size
-        self.train_size   = train_size
-        self.target_loss  = target_loss
-        self.use_val      = use_val
+    def on_fit_start(self, trainer, pl_module):
+        self._t0 = time.perf_counter()
 
-        self.t0 = None
-        self.epoch_starts = []
-        self.epoch_durations = []
-        self.total_epochs = 0
-
-        self.converged = False
-        self.convergence_epoch = None
-        self.convergence_time_s = None
-        self.gradient_steps = None
-
-        self.max_gpu_mem = 0
-        self.max_cpu_rss = 0  # placeholder (psutil optional)
-
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        self.t0 = time.perf_counter()
+    def on_fit_end(self, trainer, pl_module):
+        self._t1 = time.perf_counter()
 
     def on_train_epoch_start(self, trainer, pl_module):
-        self.epoch_starts.append(time.perf_counter())
+        self._t_epoch = time.perf_counter()
 
     def on_train_epoch_end(self, trainer, pl_module):
-        t1 = time.perf_counter()
-        if self.epoch_starts:
-            self.epoch_durations.append(t1 - self.epoch_starts[-1])
-        self.total_epochs += 1
+        t = time.perf_counter()
+        if self._t_epoch is not None:
+            self.epoch_times.append(t - self._t_epoch)
+        self._t_epoch = None
 
-        # Track GPU memory (max) on rank 0 if CUDA
-        if torch.cuda.is_available() and torch.cuda.current_device() == 0:
-            self.max_gpu_mem = max(self.max_gpu_mem, torch.cuda.max_memory_reserved(0))
-
-        # Convergence check at end of epoch (val preferred)
-        if not self.converged:
-            metrics = trainer.callback_metrics
-            key = "val_loss" if self.use_val and ("val_loss" in metrics) else "train_loss"
-            loss_val = float(metrics.get(key, float("inf")))
-            if loss_val <= self.target_loss:
-                self.converged = True
-                self.convergence_epoch = self.total_epochs
-                self.convergence_time_s = time.perf_counter() - self.t0
-                # gradient steps up to and including this epoch
-                steps_per_epoch = math.ceil(self.train_size / self.global_batch)
-                self.gradient_steps = steps_per_epoch * self.convergence_epoch
-
-    def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        pass
-
-    def finalize(self, trainer: pl.Trainer) -> Dict[str, Any]:
-        wall = time.perf_counter() - self.t0 if self.t0 else None
-        avg_epoch = (sum(self.epoch_durations) / len(self.epoch_durations)) if self.epoch_durations else None
-        total_samples = self.train_size * (self.total_epochs if self.total_epochs else 0)
-        sps = (total_samples / wall) if wall and wall > 0 else None
-
-        # Convert bytes -> GiB for readability
-        mem_gib = (self.max_gpu_mem / (1024**3)) if self.max_gpu_mem else 0.0
-
-        return dict(
-            wall_clock_s=wall,
-            epoch_time_s=avg_epoch,
-            total_epochs=self.total_epochs,
-            samples_per_sec=sps,
-            convergence_time_s=(self.convergence_time_s if self.converged else None),
-            gradient_steps=(self.gradient_steps if self.converged else None),
-            max_memory_gib=mem_gib,
-        )
+    @property
+    def wall_time(self):
+        if self._t0 is None or self._t1 is None:
+            return None
+        return self._t1 - self._t0
 
 
-# =========================
-# Runner: one configuration
-# =========================
-@dataclass
-class RunConfig:
-    label: str                  # e.g., "cpu-1", "gpu-1", "gpu-2", "gpu-4"
-    accelerator: str            # "cpu" or "gpu"
-    devices: int                # 1,2,4
-    strategy: str               # "auto" or "ddp"
-    global_batch: int
-
-@dataclass
-class RunResult:
-    hardware: str
-    wall_clock_s: Optional[float]
-    epoch_time_s: Optional[float]
-    total_epochs: int
-    samples_per_sec: Optional[float]
-    convergence_time_s: Optional[float]
-    gradient_steps: Optional[int]
-    max_memory_gib: Optional[float]
-
-def per_device_batch(global_batch: int, world_size: int) -> int:
-    if world_size < 1:
-        world_size = 1
-    b = max(1, global_batch // world_size)
-    if b * world_size != global_batch:
-        print(f"[warn] global_batch={global_batch} not divisible by world_size={world_size}; "
-              f"using per_device_batch={b} (effective global={b*world_size}).")
-    return b
-
-def run_single_config(args, cfg: RunConfig) -> RunResult:
-    # Synthesize data
-    C, X, Y = make_synth(
-        n=args.n, c_dim=args.c_dim, x_dim=args.x_dim, y_dim=args.y_dim,
-        noise=args.noise, seed=args.seed
-    )
-
-    # Split indices (simple holdout)
-    n = C.shape[0]
-    n_val = int(n * args.val_split)
-    permutation = np.random.default_rng(args.seed).permutation(n)
-    val_idx = permutation[:n_val]
-    train_idx = permutation[n_val:]
-
-    world_size = cfg.devices if cfg.accelerator == "gpu" and cfg.strategy == "ddp" else 1
-    eff_per_device = per_device_batch(cfg.global_batch, world_size)
-
-    # DataModule (map-style; Lightning will shard w/ DistributedSampler)
+def run_one(cfg, data, args):
+    """
+    cfg: dict with keys:
+      - label: str (e.g., "cpu", "gpu-1", "gpu-2", ...)
+      - accelerator: "cpu" or None
+      - devices: "auto" or int
+      - strategy: "auto" or "ddp"
+    """
+    C, X, Y = data
+    # datamodule (map-style -> PL autoshard)
+    pin_mem = (cfg["accelerator"] != "cpu")
     dm = ContextualizedRegressionDataModule(
         C=C, X=X, Y=Y,
         task_type="singletask_multivariate",
-        train_idx=train_idx, val_idx=val_idx, test_idx=None,
-        predict_idx=val_idx,
-        train_batch_size=eff_per_device,
-        val_batch_size=eff_per_device,
-        test_batch_size=eff_per_device,
-        predict_batch_size=eff_per_device,
+        train_idx=None, val_idx=None, test_idx=None, predict_idx=None,
+        train_batch_size=args.batch_size,
+        val_batch_size=args.batch_size,
+        test_batch_size=args.batch_size,
+        predict_batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=(cfg.accelerator == "gpu"),
-        persistent_workers=bool(args.num_workers > 0),
-        drop_last=False,
+        pin_memory=pin_mem,
+        persistent_workers=bool(args.persistent_workers and args.num_workers > 0),
+        drop_last=True,
         shuffle_train=True,
         shuffle_eval=False,
         dtype=torch.float,
     )
-    dm.prepare_data(); dm.setup()
 
-    # Model
-    model = ContextualizedRegression(
-        context_dim=args.c_dim,
+    model_kwargs = dict(
+        context_dim=args.context_dim,
         x_dim=args.x_dim,
         y_dim=args.y_dim,
-        num_archetypes=args.archetypes,
-        encoder_type="mlp",
-        encoder_kwargs=dict(width=args.width, layers=args.layers, link_fn="identity"),
+        num_archetypes=args.num_archetypes,
+        encoder_type=args.encoder_type,
+        encoder_kwargs={"width": args.width, "layers": args.layers, "link_fn": "identity"},
         learning_rate=args.lr,
         metamodel_type="subtype",
         fit_intercept=True,
@@ -242,189 +111,155 @@ def run_single_config(args, cfg: RunConfig) -> RunResult:
         loss_fn="mse",
         model_regularizer="none",
     )
+    model = ContextualizedRegression(**model_kwargs)
 
-    # Metrics
-    use_val = args.val_split > 0.0
-    mcb = MetricsCallback(
-        global_batch_size=(eff_per_device * world_size),
-        train_size=len(train_idx),
-        target_loss=args.target_loss,
-        use_val=use_val,
-    )
+    # precision
+    prec_map = {"32":32, "64":64, "16":"16-mixed", "bf16":"bf16-mixed"}
+    precision = prec_map[args.precision]
 
-    # Trainer (via your factory)
+    timing_cb = TimingCallback()
     trainer = make_trainer_with_env(
-        RegressionTrainer,
-        max_epochs=args.max_epochs,
-        enable_progress_bar=False,
+        trainer_cls=RegressionTrainer,
+        max_epochs=args.epochs,
+        accelerator=cfg["accelerator"],
+        devices=cfg["devices"],
+        strategy=cfg["strategy"],
         logger=False,
-        accelerator=cfg.accelerator,
-        devices=(cfg.devices if cfg.accelerator == "gpu" else 1),
-        strategy=cfg.strategy,         # "ddp" or "auto"
-        precision=32,
-        callbacks=[mcb],
-        # sanity & val
+        enable_progress_bar=False,
+        enable_checkpointing=False,
         num_sanity_val_steps=0,
-        limit_val_batches=(1.0 if use_val else 0.0),
+        precision=precision,
+        limit_val_batches=0,
+        limit_train_batches=1.0,
+        callbacks=[timing_cb],
     )
 
-    # Fit
-    if use_val and dm.val_dataloader() is not None:
-        trainer.fit(model, train_dataloaders=dm.train_dataloader(), val_dataloaders=dm.val_dataloader())
-    else:
-        trainer.fit(model, train_dataloaders=dm.train_dataloader())
+    # Warmup 1 epoch for stable timings (optional)
+    warm_model = ContextualizedRegression(**model_kwargs)
+    trainer.fit(warm_model, train_dataloaders=dm.train_dataloader())
 
-    # Finalize metrics (rank-0 only meaningful; in non-ddp it's fine)
-    metrics = mcb.finalize(trainer)
+    # Timed run
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    trainer.fit(model, train_dataloaders=dm.train_dataloader())
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
-    return RunResult(
-        hardware=cfg.label,
-        wall_clock_s=metrics["wall_clock_s"],
-        epoch_time_s=metrics["epoch_time_s"],
-        total_epochs=metrics["total_epochs"],
-        samples_per_sec=metrics["samples_per_sec"],
-        convergence_time_s=metrics["convergence_time_s"],
-        gradient_steps=(int(metrics["gradient_steps"]) if metrics["gradient_steps"] is not None else None),
-        max_memory_gib=metrics["max_memory_gib"],
-    )
+    # metrics
+    # Compute seen samples per epoch (drop_last=True)
+    steps_per_epoch = math.ceil(len(C) / args.batch_size)
+    seen_per_epoch = steps_per_epoch * args.batch_size
+    total_seen = seen_per_epoch * args.epochs
+    wall = timing_cb.wall_time
+    throughput = total_seen / wall if wall and wall > 0 else float("nan")
+    world_size = trainer.num_devices if hasattr(trainer, "num_devices") else 1
 
+    return {
+        "label": cfg["label"],
+        "world_size": world_size,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "precision": args.precision,
+        "epochs": args.epochs,
+        "steps_per_epoch": steps_per_epoch,
+        "samples_per_epoch": seen_per_epoch,
+        "wall_time_s": wall,
+        "throughput_samples_per_s": throughput,
+        "per_gpu_throughput": throughput / max(1, world_size),
+        "epoch_times_s": timing_cb.epoch_times,
+    }
 
-# =========================
-# Sweep driver (single node)
-# =========================
-def run_sweep(args):
-    results_dir = Path(args.outdir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    table_csv = results_dir / "bench_results.csv"
-
-    # Default sweep: 1 CPU, 1 GPU, 2 GPU, 4 GPU (skip GPU configs if no CUDA)
-    cuda_ok = torch.cuda.is_available()
-
-    sweep: List[RunConfig] = [
-        RunConfig("cpu-1", "cpu", 1, "auto", args.global_batch),
-    ]
-    if cuda_ok:
-        # respect available device count
-        ndev = torch.cuda.device_count()
-        if ndev >= 1: sweep.append(RunConfig("gpu-1", "gpu", 1, "auto", args.global_batch))
-        if ndev >= 2: sweep.append(RunConfig("gpu-2", "gpu", 2, "ddp", args.global_batch))
-        if ndev >= 4: sweep.append(RunConfig("gpu-4", "gpu", 4, "ddp", args.global_batch))
-
-    rows: List[RunResult] = []
-    for cfg in sweep:
-        print(f"\n=== Running config: {cfg.label}  (accelerator={cfg.accelerator}, devices={cfg.devices}, strategy={cfg.strategy}) ===")
-        rr = run_single_config(args, cfg)
-        rows.append(rr)
-        print(f" -> Done {cfg.label}: wall={rr.wall_clock_s:.2f}s, sps={rr.samples_per_sec:.1f}, epochs={rr.total_epochs}")
-
-    # Write CSV
-    import csv
-    with table_csv.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["hardware config", "wall-clock (s)", "epoch time (s)", "total epochs",
-                    "samples/sec", "convergence time (s)", "gradient steps", "max memory (GiB)"])
-        for r in rows:
-            w.writerow([
-                r.hardware,
-                f"{r.wall_clock_s:.6f}" if r.wall_clock_s is not None else "",
-                f"{r.epoch_time_s:.6f}" if r.epoch_time_s is not None else "",
-                r.total_epochs,
-                f"{r.samples_per_sec:.2f}" if r.samples_per_sec is not None else "",
-                f"{r.convergence_time_s:.6f}" if r.convergence_time_s is not None else "",
-                r.gradient_steps if r.gradient_steps is not None else "",
-                f"{r.max_memory_gib:.3f}" if r.max_memory_gib is not None else "",
-            ])
-    print(f"\nSaved table -> {table_csv}")
-
-    # Plots vs #GPUs (CPU shown at 0 GPUs on x-axis)
-    def hw_to_ngpu(lbl: str) -> int:
-        if lbl.startswith("cpu"): return 0
-        return int(lbl.split("-")[1])
-
-    rows_sorted = sorted(rows, key=lambda r: hw_to_ngpu(r.hardware))
-    x = [hw_to_ngpu(r.hardware) for r in rows_sorted]
-
-    def plot_metric(name: str, vals: List[Optional[float]], fname: str, ylab: str):
-        xs, ys = [], []
-        for xi, v in zip(x, vals):
-            if v is not None:
-                xs.append(xi); ys.append(v)
-        if not xs:
-            return
-        plt.figure()
-        plt.plot(xs, ys, marker="o")
-        plt.xlabel("# GPUs (CPU plotted as 0)")
-        plt.ylabel(ylab)
-        plt.title(f"{name} vs #GPUs")
-        plt.grid(True)
-        outp = results_dir / fname
-        plt.savefig(outp, bbox_inches="tight")
-        print(f"Saved plot -> {outp}")
-
-    plot_metric("Throughput (samples/sec)",
-                [r.samples_per_sec for r in rows_sorted],
-                "scaling_samples_per_sec.png", "samples/sec")
-
-    plot_metric("Wall-clock",
-                [r.wall_clock_s for r in rows_sorted],
-                "scaling_wallclock.png", "seconds")
-
-    plot_metric("Epoch time",
-                [r.epoch_time_s for r in rows_sorted],
-                "scaling_epoch_time.png", "seconds/epoch")
-
-    plot_metric("Convergence time",
-                [r.convergence_time_s for r in rows_sorted],
-                "scaling_convergence_time.png", "seconds")
-
-
-# =========================
-# CLI
-# =========================
-def parse_args():
-    p = argparse.ArgumentParser(description="Contextualized-ML scalability benchmark")
-    # Data
-    p.add_argument("--n", type=int, default=200_000, help="number of samples (synthetic)")
-    p.add_argument("--c-dim", type=int, default=16)
-    p.add_argument("--x-dim", type=int, default=64)
-    p.add_argument("--y-dim", type=int, default=1)
-    p.add_argument("--noise", type=float, default=0.10)
-    p.add_argument("--seed", type=int, default=123)
-
-    # Training
-    p.add_argument("--global-batch", type=int, default=4096, help="fixed global batch across configs")
-    p.add_argument("--max-epochs", type=int, default=5)
-    p.add_argument("--val-split", type=float, default=0.1)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--archetypes", type=int, default=8)
-    p.add_argument("--width", type=int, default=64)
-    p.add_argument("--layers", type=int, default=3)
-    p.add_argument("--num-workers", type=int, default=8)
-    p.add_argument("--target-loss", type=float, default=0.02,
-                   help="convergence threshold on (val_loss or train_loss)")
-
-    # I/O
-    p.add_argument("--outdir", type=str, default="results")
-    p.add_argument("--mode", choices=["sweep", "single"], default="sweep",
-                   help="sweep = run CPU+GPU configs; single = run one config given below")
-    # For --mode single (debugging)
-    p.add_argument("--single-accel", choices=["cpu", "gpu"], default="cpu")
-    p.add_argument("--single-devices", type=int, default=1)
-    p.add_argument("--single-strategy", choices=["auto", "ddp"], default="auto")
-
-    return p.parse_args()
-
+def plot_one(x, y, xlabel, ylabel, outpng):
+    plt.figure()
+    plt.plot(x, y, marker="o")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(outpng, dpi=150)
+    plt.close()
 
 def main():
-    args = parse_args()
-    if args.mode == "sweep":
-        run_sweep(args)
-    else:
-        label = f"{args.single_accel}-{args.single_devices}"
-        cfg = RunConfig(label, args.single_accel, args.single_devices, args.single_strategy, args.global_batch)
-        rr = run_single_config(args, cfg)
-        print(json.dumps(asdict(rr), indent=2))
+    env_defaults()
 
+    ap = argparse.ArgumentParser()
+    # data/model
+    ap.add_argument("--n-samples", type=int, default=300_000)
+    ap.add_argument("--context-dim", type=int, default=32)
+    ap.add_argument("--x-dim", type=int, default=256)
+    ap.add_argument("--y-dim", type=int, default=64)
+    ap.add_argument("--encoder-type", type=str, default="mlp", choices=["mlp","ngam","linear"])
+    ap.add_argument("--width", type=int, default=1024)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--num-archetypes", type=int, default=10)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--epochs", type=int, default=3)
+    # dataloader
+    ap.add_argument("--batch-size", type=int, default=2048)
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--persistent-workers", action="store_true", default=True)
+    # precision
+    ap.add_argument("--precision", type=str, default="bf16", choices=["32","16","bf16","64"])
+    # output
+    ap.add_argument("--outdir", type=str, default="bench_out")
+    args = ap.parse_args()
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # synth data
+    data = make_synth(args.n_samples, args.context_dim, args.x_dim, args.y_dim)
+
+    # decide available gpu configs
+    n_gpus = torch.cuda.device_count()
+    configs = [{"label":"cpu", "accelerator":"cpu", "devices=ignored":1, "devices":1, "strategy":"auto"}]
+    for k in [1,2,3,4]:
+        if n_gpus >= k:
+            configs.append({"label":f"gpu-{k}", "accelerator":None, "devices":k, "strategy":"ddp"})
+
+    results = []
+    for cfg in configs:
+        print(f"\n=== Running {cfg['label']} ===")
+        res = run_one(cfg, data, args)
+        for k,v in res.items():
+            if k != "epoch_times_s":
+                print(f"{k}: {v}")
+        results.append(res)
+
+    # write CSV
+    csv_path = outdir / "scale_results.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "label","world_size","batch_size","num_workers","precision","epochs",
+            "steps_per_epoch","samples_per_epoch","wall_time_s","throughput_samples_per_s","per_gpu_throughput","epoch_times_s"
+        ])
+        for r in results:
+            w.writerow([
+                r["label"], r["world_size"], r["batch_size"], r["num_workers"], r["precision"], r["epochs"],
+                r["steps_per_epoch"], r["samples_per_epoch"], f"{r['wall_time_s']:.6f}",
+                f"{r['throughput_samples_per_s']:.3f}", f"{r['per_gpu_throughput']:.3f}",
+                ";".join(f"{et:.6f}" for et in r["epoch_times_s"])
+            ])
+    print(f"\n[Saved] {csv_path}")
+
+    # plots
+    xs = [ (0 if r["label"]=="cpu" else r["world_size"]) for r in results ]
+    labels = [r["label"] for r in results]
+
+    # Throughput vs devices (GPU counts; CPU plotted at 0)
+    plot_one(xs, [r["throughput_samples_per_s"] for r in results],
+             "Devices (0=CPU)", "Throughput (samples/s)", str(outdir / "throughput_vs_devices.png"))
+    # Wall time vs devices
+    plot_one(xs, [r["wall_time_s"] for r in results],
+             "Devices (0=CPU)", "Wall time (s)", str(outdir / "walltime_vs_devices.png"))
+    # Mean epoch time vs devices
+    plot_one(xs, [float(np.mean(r["epoch_times_s"])) for r in results],
+             "Devices (0=CPU)", "Mean epoch time (s)", str(outdir / "epoch_time_vs_devices.png"))
+
+    print(f"[Saved] {outdir/'throughput_vs_devices.png'}")
+    print(f"[Saved] {outdir/'walltime_vs_devices.png'}")
+    print(f"[Saved] {outdir/'epoch_time_vs_devices.png'}")
 
 if __name__ == "__main__":
     main()
