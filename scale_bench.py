@@ -1,265 +1,385 @@
 #!/usr/bin/env python3
-"""
-Sweep benchmark for Contextualized-ML scaling.
+import os, time, csv, argparse, math, json
+from dataclasses import dataclass
+from typing import List, Dict
+from datetime import timedelta
 
-Runs: CPU, 1-GPU, 2-GPU, 3-GPU, 4-GPU (skips if not available).
-Outputs:
-  - bench_out/scale_results.csv
-  - bench_out/throughput_vs_devices.png
-  - bench_out/walltime_vs_devices.png
-  - bench_out/epoch_time_vs_devices.png
-"""
-
-import os, time, argparse, csv, math
-from pathlib import Path
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-
-from contextualized.regression.datamodules import ContextualizedRegressionDataModule
-from contextualized.regression import ContextualizedRegression
-from contextualized.regression.trainers import RegressionTrainer, make_trainer_with_env
+import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.strategies import DDPStrategy
 
-# ----------------- utils -----------------
-def env_defaults():
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# ---- your package pieces ----
+from contextualized.regression import ContextualizedRegression
+from contextualized.regression.datamodules import ContextualizedRegressionDataModule
+
+
+# ---------------- utils ----------------
+def set_env_defaults():
+    # Light, deterministic-friendly defaults
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-def make_synth(n, c_dim, x_dim, y_dim, seed=1337):
-    rng = np.random.RandomState(seed)
-    C = rng.randn(n, c_dim).astype("float32")
-    X = rng.randn(n, x_dim).astype("float32")
-    W = rng.randn(y_dim, x_dim).astype("float32")
-    b = rng.randn(y_dim, 1).astype("float32")
-    Y = (X @ W.T + b.squeeze(-1) + 0.05 * rng.randn(n, y_dim)).astype("float32")
-    return C, X, Y
+    # Prefer new PyTorch var (2.4+); avoid deprecated NCCL_ASYNC_ERROR_HANDLING
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("NCCL_DEBUG", "WARN")
+    os.environ.setdefault("NCCL_P2P_DISABLE", "0")
+    # Most cloud nodes lack IB; default it off for reliability
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")
 
-class TimingCallback(Callback):
-    """Collect per-epoch timings and global wall time."""
+    # If user didn't set NCCL_SOCKET_IFNAME, auto-pick a sane one
+    if "NCCL_SOCKET_IFNAME" not in os.environ:
+        try:
+            ifaces = [d for d in os.listdir("/sys/class/net") if os.path.isdir(f"/sys/class/net/{d}")]
+            cand = next((i for i in ifaces if i not in ("lo", "docker0")), None)
+            os.environ["NCCL_SOCKET_IFNAME"] = cand or "lo"
+        except Exception:
+            os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+
+    # Unique rendezvous per run
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(12355 + (os.getpid() % 20000)))
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        keys = ["NCCL_DEBUG","NCCL_IB_DISABLE","NCCL_P2P_DISABLE","NCCL_SOCKET_IFNAME","MASTER_ADDR","MASTER_PORT"]
+        print("DDP/NCCL env:", {k: os.environ.get(k) for k in keys})
+
+
+def map_precision(p):
+    p = (p or "").lower()
+    if p in ("bf16", "bfloat16", "bf16-mixed"):
+        return "bf16-mixed"
+    if p in ("fp16", "16", "16-mixed"):
+        return "16-mixed"
+    return 32  # full precision
+
+
+class EpochTimer(Callback):
     def __init__(self):
+        self._epoch_start = None
         self.epoch_times = []
-        self._t_epoch = None
-        self._t0 = None
-        self._t1 = None
 
-    def on_fit_start(self, trainer, pl_module):
-        self._t0 = time.perf_counter()
-
-    def on_fit_end(self, trainer, pl_module):
-        self._t1 = time.perf_counter()
+    @staticmethod
+    def _using_cuda(trainer) -> bool:
+        try:
+            return trainer.accelerator is not None and "cuda" in str(trainer.accelerator).lower()
+        except Exception:
+            return torch.cuda.is_available()
 
     def on_train_epoch_start(self, trainer, pl_module):
-        self._t_epoch = time.perf_counter()
+        if self._using_cuda(trainer):
+            torch.cuda.synchronize()
+        self._epoch_start = time.time()
 
     def on_train_epoch_end(self, trainer, pl_module):
-        t = time.perf_counter()
-        if self._t_epoch is not None:
-            self.epoch_times.append(t - self._t_epoch)
-        self._t_epoch = None
-
-    @property
-    def wall_time(self):
-        if self._t0 is None or self._t1 is None:
-            return None
-        return self._t1 - self._t0
+        if self._using_cuda(trainer):
+            torch.cuda.synchronize()
+        self.epoch_times.append(time.time() - self._epoch_start)
 
 
-def run_one(cfg, data, args):
-    """
-    cfg: dict with keys:
-      - label: str (e.g., "cpu", "gpu-1", "gpu-2", ...)
-      - accelerator: "cpu" or None
-      - devices: "auto" or int
-      - strategy: "auto" or "ddp"
-    """
-    C, X, Y = data
-    # datamodule (map-style -> PL autoshard)
-    pin_mem = (cfg["accelerator"] != "cpu")
-    dm = ContextualizedRegressionDataModule(
-        C=C, X=X, Y=Y,
-        task_type="singletask_multivariate",
-        train_idx=None, val_idx=None, test_idx=None, predict_idx=None,
-        train_batch_size=args.batch_size,
-        val_batch_size=args.batch_size,
-        test_batch_size=args.batch_size,
-        predict_batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=pin_mem,
-        persistent_workers=bool(args.persistent_workers and args.num_workers > 0),
-        drop_last=True,
-        shuffle_train=True,
-        shuffle_eval=False,
-        dtype=torch.float,
-    )
+# ---------------- synthetic data ----------------
+def make_synthetic(n, c_dim, x_dim, y_dim, seed=42):
+    rng = np.random.default_rng(seed)
+    C = rng.standard_normal((n, c_dim)).astype(np.float32)
+    X = rng.standard_normal((n, x_dim)).astype(np.float32)
+    W = rng.standard_normal((y_dim, x_dim)).astype(np.float32)
+    MU = rng.standard_normal((y_dim, 1)).astype(np.float32)
+    Y = (X @ W.T) + MU.squeeze(-1) + 0.01 * rng.standard_normal((n, y_dim)).astype(np.float32)
+    return C, X, Y
 
-    model_kwargs = dict(
-        context_dim=args.context_dim,
-        x_dim=args.x_dim,
-        y_dim=args.y_dim,
-        num_archetypes=args.num_archetypes,
-        encoder_type=args.encoder_type,
-        encoder_kwargs={"width": args.width, "layers": args.layers, "link_fn": "identity"},
-        learning_rate=args.lr,
-        metamodel_type="subtype",
+
+# ---------------- model/trainer builders ----------------
+def build_model(c_dim, x_dim, y_dim, width, layers, lr):
+    model = ContextualizedRegression(
+        context_dim=c_dim,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        num_archetypes=8,
+        encoder_type="mlp",
+        encoder_kwargs={"width": width, "layers": layers, "link_fn": "identity"},
+        learning_rate=lr,
         fit_intercept=True,
         link_fn="identity",
         loss_fn="mse",
         model_regularizer="none",
     )
-    model = ContextualizedRegression(**model_kwargs)
+    return model
 
-    # precision
-    prec_map = {"32":32, "64":64, "16":"16-mixed", "bf16":"bf16-mixed"}
-    precision = prec_map[args.precision]
 
-    timing_cb = TimingCallback()
-    trainer = make_trainer_with_env(
-        trainer_cls=RegressionTrainer,
-        max_epochs=args.epochs,
-        accelerator=cfg["accelerator"],
-        devices=cfg["devices"],
-        strategy=cfg["strategy"],
+def build_dm(
+    C, X, Y,
+    train_batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+):
+    n = C.shape[0]
+    perm = np.random.permutation(n)
+    n_train = int(0.9 * n)
+    train_idx = perm[:n_train]
+    val_idx = perm[n_train:]
+
+    dm = ContextualizedRegressionDataModule(
+        C=C, X=X, Y=Y,
+        task_type="singletask_multivariate",
+        train_idx=train_idx,
+        val_idx=val_idx,
+        test_idx=None,
+        predict_idx=None,
+        train_batch_size=train_batch_size,
+        val_batch_size=train_batch_size,
+        test_batch_size=train_batch_size,
+        predict_batch_size=train_batch_size,
+        num_workers=num_workers,
+        pin_memory=bool(pin_memory),
+        persistent_workers=bool(num_workers > 0),
+        drop_last=True,
+        shuffle_train=True,
+        shuffle_eval=False,
+        dtype=torch.float,
+    )
+    dm.prepare_data(); dm.setup()
+    return dm
+
+
+def build_trainer(devices, precision, epochs, ddp_timeout_s=120):
+    if devices == 0:
+        accelerator = "cpu"
+        devices = 1
+        strategy = "auto"
+    elif devices == 1:
+        accelerator = "gpu"
+        strategy = "auto"
+    else:
+        accelerator = "gpu"
+        strategy = DDPStrategy(
+            start_method="spawn",
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            static_graph=True,
+            timeout=timedelta(seconds=ddp_timeout_s),
+        )
+    timer = EpochTimer()
+    trainer = pl.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
+        precision=precision,
+        max_epochs=epochs,
         logger=False,
-        enable_progress_bar=False,
         enable_checkpointing=False,
         num_sanity_val_steps=0,
-        precision=precision,
-        limit_val_batches=0,
-        limit_train_batches=1.0,
-        callbacks=[timing_cb],
+        enable_progress_bar=False,
+        log_every_n_steps=50,
+        callbacks=[timer],
+        inference_mode=False,
+    )
+    return trainer, timer
+
+
+# ---------------- benchmark runner ----------------
+@dataclass
+class BenchCfg:
+    label: str
+    devices: int      # 0=cpu, >=1 gpus
+
+
+def run_once(cfg: BenchCfg, C, X, Y, args) -> Dict:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # datamodule
+    dm = build_dm(
+        C, X, Y,
+        train_batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=(cfg.devices >= 1),
+    )
+    # model
+    model = build_model(args.context_dim, args.x_dim, args.y_dim,
+                        args.width, args.layers, args.lr)
+
+    # ---- warm-up on the SAME accelerator config ----
+    tiny = max(1024, math.ceil(0.01 * C.shape[0]))
+    dm_warm = build_dm(
+        C[:tiny], X[:tiny], Y[:tiny],
+        train_batch_size=args.batch_size,
+        num_workers=0,
+        pin_memory=(cfg.devices >= 1),
+    )
+    warm_trainer, _ = build_trainer(
+        devices=cfg.devices,                    # cpu: 0, 1-gpu: 1, multi: k
+        precision=map_precision(args.precision),
+        epochs=1,
+        ddp_timeout_s=args.ddp_timeout,
+    )
+    warm_trainer.fit(model, train_dataloaders=dm_warm.train_dataloader())
+
+    # ---- main timed run ----
+    trainer, timer = build_trainer(
+        devices=cfg.devices,
+        precision=map_precision(args.precision),
+        epochs=args.epochs,
+        ddp_timeout_s=args.ddp_timeout,
     )
 
-    # Warmup 1 epoch for stable timings (optional)
-    warm_model = ContextualizedRegression(**model_kwargs)
-    trainer.fit(warm_model, train_dataloaders=dm.train_dataloader())
-
-    # Timed run
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    t0 = time.time()
     trainer.fit(model, train_dataloaders=dm.train_dataloader())
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    wall = time.time() - t0
 
-    # metrics
-    # Compute seen samples per epoch (drop_last=True)
-    steps_per_epoch = math.ceil(len(C) / args.batch_size)
-    seen_per_epoch = steps_per_epoch * args.batch_size
-    total_seen = seen_per_epoch * args.epochs
-    wall = timing_cb.wall_time
-    throughput = total_seen / wall if wall and wall > 0 else float("nan")
-    world_size = trainer.num_devices if hasattr(trainer, "num_devices") else 1
+    # metrics (use actual train size, not full N)
+    train_samples = len(dm.train_dataloader().dataset)
+    samples_total = train_samples * args.epochs
+    throughput = samples_total / max(wall, 1e-9)
+    per_device = (throughput / max(cfg.devices, 1)) if cfg.devices >= 1 else throughput
+    epoch_times = timer.epoch_times[:]  # seconds per epoch
 
-    return {
-        "label": cfg["label"],
-        "world_size": world_size,
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-        "precision": args.precision,
-        "epochs": args.epochs,
-        "steps_per_epoch": steps_per_epoch,
-        "samples_per_epoch": seen_per_epoch,
-        "wall_time_s": wall,
-        "throughput_samples_per_s": throughput,
-        "per_gpu_throughput": throughput / max(1, world_size),
-        "epoch_times_s": timing_cb.epoch_times,
-    }
+    res = dict(
+        label=cfg.label,
+        devices=cfg.devices,
+        wall_seconds=wall,
+        samples_total=int(samples_total),
+        throughput_samples_per_s=throughput,
+        per_device_throughput=per_device,
+        steps_per_epoch=math.ceil(train_samples / args.batch_size),
+        samples_per_epoch=int(train_samples),
+        epoch_times=epoch_times,
+    )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(json.dumps({
+            "label": res["label"],
+            "devices": res["devices"],
+            "wall_s": round(res["wall_seconds"], 3),
+            "throughput_sps": round(res["throughput_samples_per_s"], 2),
+            "per_device_sps": round(res["per_device_throughput"], 2),
+            "avg_epoch_s": round(float(np.mean(res["epoch_times"])) if res["epoch_times"] else float("nan"), 3)
+        }, indent=2))
+    return res
 
-def plot_one(x, y, xlabel, ylabel, outpng):
+
+def save_csv(rows: List[Dict], outdir: str):
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "scale_results.csv")
+    fields = ["label","devices","wall_seconds","samples_total",
+              "throughput_samples_per_s","per_device_throughput",
+              "steps_per_epoch","samples_per_epoch","epoch_times"]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            r2 = r.copy()
+            r2["epoch_times"] = ";".join(f"{x:.6f}" for x in r["epoch_times"])
+            w.writerow(r2)
+    return path
+
+
+def plot_curves(rows: List[Dict], outdir: str):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    os.makedirs(outdir, exist_ok=True)
+    labels = [r["label"] for r in rows]
+    devs = [r["devices"] for r in rows]
+    thr = [r["throughput_samples_per_s"] for r in rows]
+    wall = [r["wall_seconds"] for r in rows]
+    avg_epoch = [np.mean(r["epoch_times"]) if r["epoch_times"] else float("nan") for r in rows]
+
+    # Throughput
     plt.figure()
-    plt.plot(x, y, marker="o")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.grid(True)
+    plt.plot(devs, thr, marker="o")
+    plt.xticks(devs, labels, rotation=30, ha="right")
+    plt.xlabel("Configuration")
+    plt.ylabel("Throughput (samples/s)")
+    plt.title("Throughput vs Devices")
     plt.tight_layout()
-    plt.savefig(outpng, dpi=150)
+    plt.savefig(os.path.join(outdir, "throughput_vs_devices.png"))
     plt.close()
 
-def main():
-    env_defaults()
+    # Wall time
+    plt.figure()
+    plt.plot(devs, wall, marker="o")
+    plt.xticks(devs, labels, rotation=30, ha="right")
+    plt.xlabel("Configuration")
+    plt.ylabel("Total Wall Time (s)")
+    plt.title("Wall Time vs Devices")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "walltime_vs_devices.png"))
+    plt.close()
 
+    # Avg epoch time
+    plt.figure()
+    plt.plot(devs, avg_epoch, marker="o")
+    plt.xticks(devs, labels, rotation=30, ha="right")
+    plt.xlabel("Configuration")
+    plt.ylabel("Avg Train Epoch Time (s)")
+    plt.title("Epoch Time vs Devices")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "epoch_time_vs_devices.png"))
+    plt.close()
+
+
+def is_global_zero() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+# ---------------- main ----------------
+def parse_args():
     ap = argparse.ArgumentParser()
-    # data/model
-    ap.add_argument("--n-samples", type=int, default=300_000)
-    ap.add_argument("--context-dim", type=int, default=32)
-    ap.add_argument("--x-dim", type=int, default=256)
-    ap.add_argument("--y-dim", type=int, default=64)
-    ap.add_argument("--encoder-type", type=str, default="mlp", choices=["mlp","ngam","linear"])
-    ap.add_argument("--width", type=int, default=1024)
-    ap.add_argument("--layers", type=int, default=4)
-    ap.add_argument("--num-archetypes", type=int, default=10)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--epochs", type=int, default=3)
-    # dataloader
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=2048)
     ap.add_argument("--num-workers", type=int, default=8)
-    ap.add_argument("--persistent-workers", action="store_true", default=True)
-    # precision
-    ap.add_argument("--precision", type=str, default="bf16", choices=["32","16","bf16","64"])
-    # output
+    ap.add_argument("--precision", type=str, default="bf16")
+    ap.add_argument("--n", type=int, default=2_000_000)
+    ap.add_argument("--context-dim", type=int, default=16)
+    ap.add_argument("--x-dim", type=int, default=512)
+    ap.add_argument("--y-dim", type=int, default=64)
+    ap.add_argument("--width", type=int, default=1024)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--outdir", type=str, default="bench_out")
-    args = ap.parse_args()
+    ap.add_argument("--ddp-timeout", type=int, default=120)
+    ap.add_argument("--max-gpus", type=int, default=4)
+    return ap.parse_args()
 
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
 
-    # synth data
-    data = make_synth(args.n_samples, args.context_dim, args.x_dim, args.y_dim)
+def main():
+    set_env_defaults()
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # decide available gpu configs
-    n_gpus = torch.cuda.device_count()
-    configs = [{"label":"cpu", "accelerator":"cpu", "devices=ignored":1, "devices":1, "strategy":"auto"}]
-    for k in [1,2,3,4]:
-        if n_gpus >= k:
-            configs.append({"label":f"gpu-{k}", "accelerator":None, "devices":k, "strategy":"ddp"})
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # optional micro-optim for fixed shapes
+
+    # data once
+    C, X, Y = make_synthetic(args.n, args.context_dim, args.x_dim, args.y_dim)
+
+    # configs: CPU + 1..available GPUs (cap at --max-gpus)
+    gpus = torch.cuda.device_count()
+    dev_list = [BenchCfg("cpu", 0)]
+    for k in range(1, min(args.max_gpus, gpus) + 1):
+        dev_list.append(BenchCfg(f"gpu-{k}", k))
 
     results = []
-    for cfg in configs:
-        print(f"\n=== Running {cfg['label']} ===")
-        res = run_one(cfg, data, args)
-        for k,v in res.items():
-            if k != "epoch_times_s":
-                print(f"{k}: {v}")
+    for cfg in dev_list:
+        if is_global_zero():
+            print(f"\n=== Running {cfg.label} ===")
+        res = run_once(cfg, C, X, Y, args)
         results.append(res)
 
-    # write CSV
-    csv_path = outdir / "scale_results.csv"
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "label","world_size","batch_size","num_workers","precision","epochs",
-            "steps_per_epoch","samples_per_epoch","wall_time_s","throughput_samples_per_s","per_gpu_throughput","epoch_times_s"
-        ])
-        for r in results:
-            w.writerow([
-                r["label"], r["world_size"], r["batch_size"], r["num_workers"], r["precision"], r["epochs"],
-                r["steps_per_epoch"], r["samples_per_epoch"], f"{r['wall_time_s']:.6f}",
-                f"{r['throughput_samples_per_s']:.3f}", f"{r['per_gpu_throughput']:.3f}",
-                ";".join(f"{et:.6f}" for et in r["epoch_times_s"])
-            ])
-    print(f"\n[Saved] {csv_path}")
+    if is_global_zero():
+        csv_path = save_csv(results, args.outdir)
+        plot_curves(results, args.outdir)
+        print(f"\nSaved CSV → {csv_path}")
+        print(f"Saved plots → {args.outdir}/throughput_vs_devices.png, "
+              f"walltime_vs_devices.png, epoch_time_vs_devices.png")
 
-    # plots
-    xs = [ (0 if r["label"]=="cpu" else r["world_size"]) for r in results ]
-    labels = [r["label"] for r in results]
-
-    # Throughput vs devices (GPU counts; CPU plotted at 0)
-    plot_one(xs, [r["throughput_samples_per_s"] for r in results],
-             "Devices (0=CPU)", "Throughput (samples/s)", str(outdir / "throughput_vs_devices.png"))
-    # Wall time vs devices
-    plot_one(xs, [r["wall_time_s"] for r in results],
-             "Devices (0=CPU)", "Wall time (s)", str(outdir / "walltime_vs_devices.png"))
-    # Mean epoch time vs devices
-    plot_one(xs, [float(np.mean(r["epoch_times_s"])) for r in results],
-             "Devices (0=CPU)", "Mean epoch time (s)", str(outdir / "epoch_time_vs_devices.png"))
-
-    print(f"[Saved] {outdir/'throughput_vs_devices.png'}")
-    print(f"[Saved] {outdir/'walltime_vs_devices.png'}")
-    print(f"[Saved] {outdir/'epoch_time_vs_devices.png'}")
 
 if __name__ == "__main__":
     main()
