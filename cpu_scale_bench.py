@@ -1,51 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-# 0) See what NICs you actually have (optional, for sanity):
-ls -1 /sys/class/net
-ip -o link show | awk -F': ' '{print NR-1": "$2}'
-
-# 1) Minimal, safe NCCL/torch env (no hard-coded eth0):
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export TOKENIZERS_PARALLELISM=false
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG=WARN
-export NCCL_P2P_DISABLE=0
-export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=$(ls /sys/class/net | grep -E '^(ens|enp|eno|eth|bond|ib)' | head -n1)
-# If that prints nothing on your machine, fall back to auto-exclude:
-[ -z "$NCCL_SOCKET_IFNAME" ] && export NCCL_SOCKET_IFNAME="^lo,docker0"
-
-# CUDA allocator tweak (fine to keep)
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# 2) Kill any stragglers (optional)
-pkill -f scale_bench.py || true
-pkill -f torchrun || true
-
-# 3a) Single-GPU run (torchrun, WORLD_SIZE=1)
-torchrun --standalone --nproc_per_node=1 scale_bench.py \
-  --epochs 3 --batch-size 2048 --num-workers 8 --precision bf16 \
-  --num-samples 1800000 --outdir bench_out/gpu1
-
-# 3b) Two GPUs
-torchrun --standalone --nproc_per_node=2 scale_bench.py \
-  --epochs 3 --batch-size 2048 --num-workers 8 --precision bf16 \
-  --num-samples 1800000 --outdir bench_out/gpu2
-
-# 3c) Three GPUs
-torchrun --standalone --nproc_per_node=3 scale_bench.py \
-  --epochs 3 --batch-size 2048 --num-workers 8 --precision bf16 \
-  --num-samples 1800000 --outdir bench_out/gpu3
-
-# 3d) Four GPUs
-torchrun --standalone --nproc_per_node=4 scale_bench.py \
-  --epochs 3 --batch-size 2048 --num-workers 8 --precision bf16 \
-  --num-samples 1800000 --outdir bench_out/gpu4
-
-"""
 import os, time, csv, argparse, math, json
 from dataclasses import dataclass
 from typing import List, Dict
@@ -156,6 +109,18 @@ def make_synthetic(n, c_dim, x_dim, y_dim, seed=42):
     return C, X, Y
 
 
+def load_or_make_dataset(path, n, c_dim, x_dim, y_dim, seed=42):
+    if path and os.path.exists(path):
+        npz = np.load(path)
+        C, X, Y = npz["C"], npz["X"], npz["Y"]
+        return C, X, Y
+    C, X, Y = make_synthetic(n, c_dim, x_dim, y_dim, seed=seed)
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, C=C, X=X, Y=Y)
+    return C, X, Y
+
+
 # ---------------- model/trainer builders ----------------
 def build_model(c_dim, x_dim, y_dim, width, layers, lr):
     model = ContextualizedRegression(
@@ -229,7 +194,7 @@ def build_trainer(devices, precision, epochs, ddp_timeout_s=120, torchrun_mode=F
         accelerator = "gpu"
         if torchrun_mode:
             ws = world_size()
-            devices_arg = ws  # <-- IMPORTANT: devices must equal WORLD_SIZE here
+            devices_arg = ws  # must equal WORLD_SIZE
             strategy = DDPStrategy(
                 find_unused_parameters=False,
                 gradient_as_bucket_view=True,
@@ -268,32 +233,33 @@ def build_trainer(devices, precision, epochs, ddp_timeout_s=120, torchrun_mode=F
 @dataclass
 class BenchCfg:
     label: str
-    devices: int      # >=1 gpus
+    devices: int      # 0 for cpu, >=1 for gpus
 
 
 def run_once(cfg: BenchCfg, C, X, Y, args, torchrun_mode: bool) -> Dict:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    pin = (cfg.devices >= 1)
     dm = build_dm(
         C, X, Y,
         train_batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin,
     )
     model = build_model(args.context_dim, args.x_dim, args.y_dim,
                         args.width, args.layers, args.lr)
 
-    # Warm-up (stabilize kernels/allocators) on same accelerator config
+    # Warm-up
     tiny = max(1024, math.ceil(0.01 * C.shape[0]))
     dm_warm = build_dm(
         C[:tiny], X[:tiny], Y[:tiny],
         train_batch_size=args.batch_size,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=pin,
     )
     warm_trainer, _ = build_trainer(
-        devices=(world_size() if torchrun_mode else cfg.devices),  # <-- fix
+        devices=(world_size() if torchrun_mode else cfg.devices),
         precision=map_precision(args.precision),
         epochs=1,
         ddp_timeout_s=args.ddp_timeout,
@@ -303,7 +269,7 @@ def run_once(cfg: BenchCfg, C, X, Y, args, torchrun_mode: bool) -> Dict:
 
     # Timed run
     trainer, timer = build_trainer(
-        devices=(world_size() if torchrun_mode else cfg.devices),  # <-- fix
+        devices=(world_size() if torchrun_mode else cfg.devices),
         precision=map_precision(args.precision),
         epochs=args.epochs,
         ddp_timeout_s=args.ddp_timeout,
@@ -322,21 +288,20 @@ def run_once(cfg: BenchCfg, C, X, Y, args, torchrun_mode: bool) -> Dict:
     samples_total = train_samples * args.epochs
     throughput = samples_total / max(wall, 1e-9)
 
-    world = world_size() if torchrun_mode else cfg.devices
+    # devices_for_metric: report 1 for CPU so it's easy to compare "per-device"
+    world = (world_size() if torchrun_mode else (cfg.devices if cfg.devices > 0 else 1))
     per_device = throughput / max(world, 1)
-
-    epoch_times = timer.epoch_times[:]
 
     res = dict(
         label=cfg.label,
-        devices=world,
+        devices=(world_size() if torchrun_mode else (cfg.devices if cfg.devices > 0 else 1)),
         wall_seconds=wall,
         samples_total=int(samples_total),
         throughput_samples_per_s=throughput,
         per_device_throughput=per_device,
         steps_per_epoch=math.ceil(train_samples / args.batch_size),
         samples_per_epoch=int(train_samples),
-        epoch_times=epoch_times,
+        epoch_times=timer.epoch_times[:],
     )
     if is_global_zero():
         print(json.dumps({
@@ -414,13 +379,15 @@ def plot_curves(rows: List[Dict], outdir: str):
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch-size", type=int, default=2048)  # PER GPU
+    ap.add_argument("--batch-size", type=int, default=2048)  # PER GPU/CPU
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--precision", type=str, default="bf16")
+    ap.add_argument("--dataset-cache", type=str, default="bench_out/datasets/n{n}_seed42.npz",
+                    help="Path to .npz to cache dataset. '{n}' will be replaced with num_samples.")
 
-    # Accept BOTH forms; they write to the same dest
+    # Accept BOTH forms; same dest
     ap.add_argument("--num-samples", dest="num_samples", type=int, default=2_000_000)
-    ap.add_argument("--n", dest="num_samples", type=int)  # optional legacy alias
+    ap.add_argument("--n", dest="num_samples", type=int)
 
     ap.add_argument("--context-dim", type=int, default=16)
     ap.add_argument("--x-dim", type=int, default=512)
@@ -434,7 +401,6 @@ def parse_args():
     return ap.parse_args()
 
 
-
 def main():
     set_env_defaults()
     args = parse_args()
@@ -444,30 +410,32 @@ def main():
         torch.backends.cudnn.benchmark = True
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    # Generate data once
-    C, X, Y = make_synthetic(args.num_samples, args.context_dim, args.x_dim, args.y_dim)
+    # ensure dataset cache path is concrete
+    ds_path = args.dataset_cache.format(n=args.num_samples) if args.dataset_cache else None
+    C, X, Y = load_or_make_dataset(ds_path, args.num_samples, args.context_dim, args.x_dim, args.y_dim, seed=42)
 
     results = []
     torchrun_mode = under_torchrun()
 
     if torchrun_mode:
-        # Run a single config under torchrun (WORLD_SIZE GPUs, 1 per process)
+        # Run exactly one config under torchrun (WORLD_SIZE GPUs, 1 per process)
         cfg = BenchCfg(label=f"gpu-{world_size()}", devices=1)
         if is_global_zero():
             print(f"\n=== Running {cfg.label} (torchrun, {world_size()} processes) ===")
         res = run_once(cfg, C, X, Y, args, torchrun_mode=True)
         results.append(res)
     else:
-        # Standalone: GPU-only sweep 1..k (skip CPU entirely)
+        # Standalone: run CPU + 1..k GPUs
         gpus = torch.cuda.device_count()
-        dev_list = [BenchCfg(f"gpu-{k}", k) for k in range(1, min(args.max_gpus, gpus) + 1)]
+        dev_list = [BenchCfg("cpu", 0)]
+        for k in range(1, min(args.max_gpus, gpus) + 1):
+            dev_list.append(BenchCfg(f"gpu-{k}", k))
         for cfg in dev_list:
             if is_global_zero():
                 print(f"\n=== Running {cfg.label} ===")
             res = run_once(cfg, C, X, Y, args, torchrun_mode=False)
             results.append(res)
 
-    # Save outputs
     if is_global_zero():
         csv_path = save_csv(results, args.outdir)
         plot_curves(results, args.outdir)
