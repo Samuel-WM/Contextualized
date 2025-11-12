@@ -15,21 +15,35 @@ from contextualized.regression import ContextualizedRegression
 from contextualized.regression.datamodules import ContextualizedRegressionDataModule
 
 
-# ---------------- utils ----------------
+# ---------------- launcher/cluster helpers ----------------
+def under_torchrun() -> bool:
+    e = os.environ
+    return ("LOCAL_RANK" in e) or ("RANK" in e) or ("WORLD_SIZE" in e)
+
+def world_size() -> int:
+    try:
+        return int(os.environ.get("WORLD_SIZE", "1"))
+    except Exception:
+        return 1
+
+def is_global_zero() -> bool:
+    # With torchrun Lightning sets ranks; outside it, fall back to env.
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+# ---------------- env + perf ----------------
 def set_env_defaults():
-    # Light, deterministic-friendly defaults
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # Prefer new PyTorch var (2.4+); avoid deprecated NCCL_ASYNC_ERROR_HANDLING
+    # Safe NCCL defaults for cloud
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("NCCL_DEBUG", "WARN")
     os.environ.setdefault("NCCL_P2P_DISABLE", "0")
-    # Most cloud nodes lack IB; default it off for reliability
-    os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")  # IB typically unavailable on single Lambda node
 
-    # If user didn't set NCCL_SOCKET_IFNAME, auto-pick a sane one
+    # Pick an interface if not set
     if "NCCL_SOCKET_IFNAME" not in os.environ:
         try:
             ifaces = [d for d in os.listdir("/sys/class/net") if os.path.isdir(f"/sys/class/net/{d}")]
@@ -38,13 +52,19 @@ def set_env_defaults():
         except Exception:
             os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
-    # Unique rendezvous per run
+    # Rendezvous only matters for non-torchrun spawn
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(12355 + (os.getpid() % 20000)))
 
-    if int(os.environ.get("RANK", "0")) == 0:
+    if is_global_zero():
         keys = ["NCCL_DEBUG","NCCL_IB_DISABLE","NCCL_P2P_DISABLE","NCCL_SOCKET_IFNAME","MASTER_ADDR","MASTER_PORT"]
         print("DDP/NCCL env:", {k: os.environ.get(k) for k in keys})
+
+    # Ampere+ matmul speedups
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 
 def map_precision(p):
@@ -143,24 +163,44 @@ def build_dm(
     return dm
 
 
-def build_trainer(devices, precision, epochs, ddp_timeout_s=120):
+def build_trainer(devices, precision, epochs, ddp_timeout_s=120, torchrun_mode=False):
+    """
+    devices:
+      - 0 => cpu
+      - 1 => single gpu
+      - >1 => multi-gpu (only when NOT torchrun)
+    torchrun_mode:
+      - True => use DDP (1 GPU per process), devices=1
+    """
+    timer = EpochTimer()
+
     if devices == 0:
         accelerator = "cpu"
         devices = 1
         strategy = "auto"
-    elif devices == 1:
-        accelerator = "gpu"
-        strategy = "auto"
     else:
         accelerator = "gpu"
-        strategy = DDPStrategy(
-            start_method="spawn",
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True,
-            static_graph=True,
-            timeout=timedelta(seconds=ddp_timeout_s),
-        )
-    timer = EpochTimer()
+        if torchrun_mode and world_size() > 1:
+            # true DDP under torchrun
+            strategy = DDPStrategy(
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+                static_graph=True,
+                timeout=timedelta(seconds=ddp_timeout_s),
+            )
+            devices = 1  # 1 GPU per process
+        elif devices == 1:
+            strategy = "auto"
+        else:
+            # multi-gpu without torchrun: fall back to spawn
+            strategy = DDPStrategy(
+                start_method="spawn",
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+                static_graph=True,
+                timeout=timedelta(seconds=ddp_timeout_s),
+            )
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
@@ -174,6 +214,7 @@ def build_trainer(devices, precision, epochs, ddp_timeout_s=120):
         log_every_n_steps=50,
         callbacks=[timer],
         inference_mode=False,
+        detect_anomaly=False,
     )
     return trainer, timer
 
@@ -185,7 +226,7 @@ class BenchCfg:
     devices: int      # 0=cpu, >=1 gpus
 
 
-def run_once(cfg: BenchCfg, C, X, Y, args) -> Dict:
+def run_once(cfg: BenchCfg, C, X, Y, args, torchrun_mode: bool) -> Dict:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -209,19 +250,21 @@ def run_once(cfg: BenchCfg, C, X, Y, args) -> Dict:
         pin_memory=(cfg.devices >= 1),
     )
     warm_trainer, _ = build_trainer(
-        devices=cfg.devices,                    # cpu: 0, 1-gpu: 1, multi: k
+        devices=cfg.devices if not torchrun_mode else 1,
         precision=map_precision(args.precision),
         epochs=1,
         ddp_timeout_s=args.ddp_timeout,
+        torchrun_mode=torchrun_mode,
     )
     warm_trainer.fit(model, train_dataloaders=dm_warm.train_dataloader())
 
     # ---- main timed run ----
     trainer, timer = build_trainer(
-        devices=cfg.devices,
+        devices=cfg.devices if not torchrun_mode else 1,
         precision=map_precision(args.precision),
         epochs=args.epochs,
         ddp_timeout_s=args.ddp_timeout,
+        torchrun_mode=torchrun_mode,
     )
 
     if torch.cuda.is_available():
@@ -236,12 +279,12 @@ def run_once(cfg: BenchCfg, C, X, Y, args) -> Dict:
     train_samples = len(dm.train_dataloader().dataset)
     samples_total = train_samples * args.epochs
     throughput = samples_total / max(wall, 1e-9)
-    per_device = (throughput / max(cfg.devices, 1)) if cfg.devices >= 1 else throughput
+    per_device = (throughput / (world_size() if torchrun_mode and cfg.devices >= 1 else max(cfg.devices, 1)))
     epoch_times = timer.epoch_times[:]  # seconds per epoch
 
     res = dict(
         label=cfg.label,
-        devices=cfg.devices,
+        devices=(world_size() if torchrun_mode else cfg.devices),
         wall_seconds=wall,
         samples_total=int(samples_total),
         throughput_samples_per_s=throughput,
@@ -250,7 +293,7 @@ def run_once(cfg: BenchCfg, C, X, Y, args) -> Dict:
         samples_per_epoch=int(train_samples),
         epoch_times=epoch_times,
     )
-    if int(os.environ.get("RANK", "0")) == 0:
+    if is_global_zero():
         print(json.dumps({
             "label": res["label"],
             "devices": res["devices"],
@@ -295,7 +338,7 @@ def plot_curves(rows: List[Dict], outdir: str):
     plt.figure()
     plt.plot(devs, thr, marker="o")
     plt.xticks(devs, labels, rotation=30, ha="right")
-    plt.xlabel("Configuration")
+    plt.xlabel("Devices")
     plt.ylabel("Throughput (samples/s)")
     plt.title("Throughput vs Devices")
     plt.tight_layout()
@@ -306,7 +349,7 @@ def plot_curves(rows: List[Dict], outdir: str):
     plt.figure()
     plt.plot(devs, wall, marker="o")
     plt.xticks(devs, labels, rotation=30, ha="right")
-    plt.xlabel("Configuration")
+    plt.xlabel("Devices")
     plt.ylabel("Total Wall Time (s)")
     plt.title("Wall Time vs Devices")
     plt.tight_layout()
@@ -317,7 +360,7 @@ def plot_curves(rows: List[Dict], outdir: str):
     plt.figure()
     plt.plot(devs, avg_epoch, marker="o")
     plt.xticks(devs, labels, rotation=30, ha="right")
-    plt.xlabel("Configuration")
+    plt.xlabel("Devices")
     plt.ylabel("Avg Train Epoch Time (s)")
     plt.title("Epoch Time vs Devices")
     plt.tight_layout()
@@ -325,15 +368,11 @@ def plot_curves(rows: List[Dict], outdir: str):
     plt.close()
 
 
-def is_global_zero() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-
 # ---------------- main ----------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch-size", type=int, default=2048)
+    ap.add_argument("--batch-size", type=int, default=2048)  # PER GPU
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--precision", type=str, default="bf16")
     ap.add_argument("--n", type=int, default=2_000_000)
@@ -344,7 +383,7 @@ def parse_args():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--outdir", type=str, default="bench_out")
-    ap.add_argument("--ddp-timeout", type=int, default=120)
+    ap.add_argument("--ddp-timeout", type=int, default=180)
     ap.add_argument("--max-gpus", type=int, default=4)
     return ap.parse_args()
 
@@ -355,23 +394,32 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True  # optional micro-optim for fixed shapes
+        torch.backends.cudnn.benchmark = True  # opt for fixed shapes
 
     # data once
     C, X, Y = make_synthetic(args.n, args.context_dim, args.x_dim, args.y_dim)
 
-    # configs: CPU + 1..available GPUs (cap at --max-gpus)
-    gpus = torch.cuda.device_count()
-    dev_list = [BenchCfg("cpu", 0)]
-    for k in range(1, min(args.max_gpus, gpus) + 1):
-        dev_list.append(BenchCfg(f"gpu-{k}", k))
-
     results = []
-    for cfg in dev_list:
+    torchrun_mode = under_torchrun()
+
+    if torchrun_mode:
+        # Run exactly one multi-GPU config under torchrun: devices = WORLD_SIZE
+        cfg = BenchCfg(label=f"gpu-{world_size()}", devices=1)  # 1 per proc; true DDP
         if is_global_zero():
-            print(f"\n=== Running {cfg.label} ===")
-        res = run_once(cfg, C, X, Y, args)
+            print(f"\n=== Running {cfg.label} (torchrun, {world_size()} processes) ===")
+        res = run_once(cfg, C, X, Y, args, torchrun_mode=True)
         results.append(res)
+    else:
+        # Standalone: run cpu + 1..k GPUs (ddp-spawn for k>1)
+        gpus = torch.cuda.device_count()
+        dev_list = [BenchCfg("cpu", 0)]
+        for k in range(1, min(args.max_gpus, gpus) + 1):
+            dev_list.append(BenchCfg(f"gpu-{k}", k))
+        for cfg in dev_list:
+            if is_global_zero():
+                print(f"\n=== Running {cfg.label} ===")
+            res = run_once(cfg, C, X, Y, args, torchrun_mode=False)
+            results.append(res)
 
     if is_global_zero():
         csv_path = save_csv(results, args.outdir)
