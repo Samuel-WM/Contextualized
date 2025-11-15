@@ -192,6 +192,10 @@ class SKLearnWrapper:
             print(f"Received unknown keyword argument {kw}, probably ignoring.")
 
     # -------------------- helpers --------------------
+
+    def _is_gpu(self) -> bool:
+        return self.accelerator in ("cuda", "gpu")
+
     def _update_acceptable_kwargs(self, category, new_kwargs, acceptable=True):
         if acceptable:
             self.acceptable_kwargs[category] = list(
@@ -342,8 +346,8 @@ class SKLearnWrapper:
         maybe_add("data", "test_batch_size", self.default_test_batch_size)
         maybe_add("data", "predict_batch_size", self.default_val_batch_size)
         maybe_add("data", "num_workers", 0)
-        maybe_add("data", "pin_memory", self.accelerator in ("cuda", "gpu"))
-        maybe_add("data", "persistent_workers", False)
+        maybe_add("data", "pin_memory", self._is_gpu())
+        maybe_add("data", "persistent_workers", organized["data"].get("num_workers", 0) > 0)
         maybe_add("data", "drop_last", False)
         maybe_add("data", "shuffle_train", True)
         maybe_add("data", "shuffle_eval", False)
@@ -423,7 +427,8 @@ class SKLearnWrapper:
             test_batch_size=self.default_test_batch_size,
             predict_batch_size=self.default_val_batch_size,
             num_workers=0,
-            pin_memory=(self.accelerator in ("cuda", "gpu")),
+            pin_memory=self._is_gpu(),
+            persistent_workers=None,
             persistent_workers=False,
             drop_last=False,
             shuffle_train=True,
@@ -432,6 +437,11 @@ class SKLearnWrapper:
         )
         if data_kwargs:
             dk.update(data_kwargs)
+
+        # If not explicitly set, default to True when num_workers > 0
+        if dk["persistent_workers"] is None:
+            dk["persistent_workers"] = bool(dk["num_workers"] > 0)
+
 
         dm = ContextualizedRegressionDataModule(
             C=C,
@@ -520,7 +530,7 @@ class SKLearnWrapper:
                     test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
                     predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
+                    pin_memory=self._init_kwargs["data"].get("pin_memory", self._is_gpu()),
                     persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
                     shuffle_train=False,
                     shuffle_eval=False,
@@ -569,7 +579,7 @@ class SKLearnWrapper:
                     test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
                     predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
+                    pin_memory=self._init_kwargs["data"].get("pin_memory", self._is_gpu()),
                     persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
                     shuffle_train=False,
                     shuffle_eval=False,
@@ -683,8 +693,8 @@ class SKLearnWrapper:
                     test_batch_size=organized["data"].get("test_batch_size", self.default_test_batch_size),
                     predict_batch_size=organized["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=organized["data"].get("num_workers", 0),
-                    pin_memory=organized["data"].get("pin_memory", self.accelerator in ("cuda", "gpu")),
-                    persistent_workers=organized["data"].get("persistent_workers", False),
+                    pin_memory=organized["data"].get("pin_memory", self._is_gpu()),
+                    persistent_workers=organized["data"].get("persistent_workers", organized["data"].get("num_workers", 0) > 0),
                     drop_last=organized["data"].get("drop_last", False),
                     shuffle_train=organized["data"].get("shuffle_train", True),
                     shuffle_eval=organized["data"].get("shuffle_eval", False),
