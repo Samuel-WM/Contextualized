@@ -9,7 +9,7 @@ from sklearn.preprocessing import StandardScaler
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.plugins.environments import LightningEnvironment
-from pytorch_lightning.strategies import DDPStrategy  # PL v1 Strategy API
+from pytorch_lightning.strategies import DDPStrategy  # PL v1 Strategy API (not strictly required here)
 
 from contextualized.functions import LINK_FUNCTIONS
 from contextualized.regression import REGULARIZERS, LOSSES
@@ -347,7 +347,11 @@ class SKLearnWrapper:
         maybe_add("data", "predict_batch_size", self.default_val_batch_size)
         maybe_add("data", "num_workers", 0)
         maybe_add("data", "pin_memory", self._is_gpu())
-        maybe_add("data", "persistent_workers", organized["data"].get("num_workers", 0) > 0)
+        maybe_add(
+            "data",
+            "persistent_workers",
+            organized["data"].get("num_workers", 0) > 0,
+        )
         maybe_add("data", "drop_last", False)
         maybe_add("data", "shuffle_train", True)
         maybe_add("data", "shuffle_eval", False)
@@ -357,9 +361,13 @@ class SKLearnWrapper:
         maybe_add("wrapper", "n_bootstraps", self.default_n_bootstraps)
 
         # -------- EarlyStopping / Checkpoint constructors --------
-        es_monitor = organized["wrapper"].get("es_monitor", "val_loss" if use_val else "train_loss")
+        es_monitor = organized["wrapper"].get(
+            "es_monitor", "val_loss" if use_val else "train_loss"
+        )
         es_mode = organized["wrapper"].get("es_mode", "min")
-        es_patience = organized["wrapper"].get("es_patience", self.default_es_patience)
+        es_patience = organized["wrapper"].get(
+            "es_patience", self.default_es_patience
+        )
         es_verbose = organized["wrapper"].get("es_verbose", False)
         es_min_delta = organized["wrapper"].get("es_min_delta", 0.0)
 
@@ -382,7 +390,9 @@ class SKLearnWrapper:
                 lambda i: ModelCheckpoint(
                     monitor=("val_loss" if use_val else None),
                     dirpath=f"{kwargs.get('checkpoint_path', './lightning_logs')}/boot_{i}_checkpoints",
-                    filename=("{epoch}-{val_loss:.4f}" if use_val else "{epoch}"),
+                    filename=(
+                        "{epoch}-{val_loss:.4f}" if use_val else "{epoch}"
+                    ),
                 )
             )
         organized["trainer"]["callback_constructors"] = cb_ctors
@@ -393,17 +403,24 @@ class SKLearnWrapper:
 
         # -------- sanitize any pre-specified callbacks for no-val runs --------
         cb_list = organized["trainer"].get("callbacks", [])
-        cb_list = [self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list]
+        cb_list = [
+            self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list
+        ]
         organized["trainer"]["callbacks"] = cb_list
 
         # Also sanitize dynamically constructed callbacks
         ctor_list = organized["trainer"].get("callback_constructors", [])
+
         def _wrap_ctor(ctor):
             def _wrapped(i):
                 cb = ctor(i)
                 return self._retarget_or_strip_early_stopping(cb, use_val)
+
             return _wrapped
-        organized["trainer"]["callback_constructors"] = [_wrap_ctor(c) for c in ctor_list]
+
+        organized["trainer"]["callback_constructors"] = [
+            _wrap_ctor(c) for c in ctor_list
+        ]
 
         return organized
 
@@ -428,8 +445,7 @@ class SKLearnWrapper:
             predict_batch_size=self.default_val_batch_size,
             num_workers=0,
             pin_memory=self._is_gpu(),
-            persistent_workers=None,
-            persistent_workers=False,
+            persistent_workers=None,  # <-- only once
             drop_last=False,
             shuffle_train=True,
             shuffle_eval=False,
@@ -441,7 +457,6 @@ class SKLearnWrapper:
         # If not explicitly set, default to True when num_workers > 0
         if dk["persistent_workers"] is None:
             dk["persistent_workers"] = bool(dk["num_workers"] > 0)
-
 
         dm = ContextualizedRegressionDataModule(
             C=C,
@@ -511,9 +526,13 @@ class SKLearnWrapper:
         return X
 
     # -------------------- public API --------------------
-    def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
+    def predict(
+        self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
+    ):
         if not hasattr(self, "models") or self.models is None:
-            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
+            raise ValueError(
+                "Trying to predict with a model that hasn't been trained yet."
+            )
 
         Cq = self._maybe_scale_C(C)
         Xq = self._maybe_scale_X(X)
@@ -522,24 +541,41 @@ class SKLearnWrapper:
         preds = []
         for i in range(len(self.models)):
             dm = self._build_datamodule(
-                C=Cq, X=Xq, Y=Yq,
+                C=Cq,
+                X=Xq,
+                Y=Yq,
                 predict_idx=np.arange(len(Cq)),
                 data_kwargs=dict(
-                    train_batch_size=self._init_kwargs["data"].get("train_batch_size", self.default_train_batch_size),
-                    val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
-                    test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
-                    predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
+                    train_batch_size=self._init_kwargs["data"].get(
+                        "train_batch_size", self.default_train_batch_size
+                    ),
+                    val_batch_size=self._init_kwargs["data"].get(
+                        "val_batch_size", self.default_val_batch_size
+                    ),
+                    test_batch_size=self._init_kwargs["data"].get(
+                        "test_batch_size", self.default_test_batch_size
+                    ),
+                    predict_batch_size=self._init_kwargs["data"].get(
+                        "predict_batch_size", self.default_val_batch_size
+                    ),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get("pin_memory", self._is_gpu()),
-                    persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
+                    pin_memory=self._init_kwargs["data"].get(
+                        "pin_memory", self._is_gpu()
+                    ),
+                    persistent_workers=self._init_kwargs["data"].get(
+                        "persistent_workers", False
+                    ),
                     shuffle_train=False,
                     shuffle_eval=False,
                     dtype=self._init_kwargs["data"].get("dtype", torch.float),
                 ),
-                task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
-                        else "singletask_multivariate",
+                task_type="singletask_univariate"
+                if self._init_kwargs["model"].get("univariate", False)
+                else "singletask_multivariate",
             )
-            yhat = self.trainers[i].predict_y(self.models[i], dm.predict_dataloader(), **kwargs)
+            yhat = self.trainers[i].predict_y(
+                self.models[i], dm.predict_dataloader(), **kwargs
+            )
             preds.append(yhat)
 
         predictions = np.array(preds)
@@ -547,7 +583,9 @@ class SKLearnWrapper:
             predictions = np.mean(predictions, axis=0)
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
-                predictions = np.array([self.scalers["Y"].inverse_transform(p) for p in predictions])
+                predictions = np.array(
+                    [self.scalers["Y"].inverse_transform(p) for p in predictions]
+                )
             else:
                 predictions = self.scalers["Y"].inverse_transform(predictions)
         return predictions
@@ -560,7 +598,9 @@ class SKLearnWrapper:
         **kwargs,
     ):
         if not hasattr(self, "models") or self.models is None:
-            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
+            raise ValueError(
+                "Trying to predict with a model that hasn't been trained yet."
+            )
 
         Cq = self._maybe_scale_C(C)
         X_zero = np.zeros((len(Cq), self.x_dim), dtype=np.float32)
@@ -574,29 +614,50 @@ class SKLearnWrapper:
                 Y=Y_zero if kwargs.pop("uses_y", True) else None,
                 predict_idx=np.arange(len(Cq)),
                 data_kwargs=dict(
-                    train_batch_size=self._init_kwargs["data"].get("train_batch_size", self.default_train_batch_size),
-                    val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
-                    test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
-                    predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
+                    train_batch_size=self._init_kwargs["data"].get(
+                        "train_batch_size", self.default_train_batch_size
+                    ),
+                    val_batch_size=self._init_kwargs["data"].get(
+                        "val_batch_size", self.default_val_batch_size
+                    ),
+                    test_batch_size=self._init_kwargs["data"].get(
+                        "test_batch_size", self.default_test_batch_size
+                    ),
+                    predict_batch_size=self._init_kwargs["data"].get(
+                        "predict_batch_size", self.default_val_batch_size
+                    ),
                     num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get("pin_memory", self._is_gpu()),
-                    persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
+                    pin_memory=self._init_kwargs["data"].get(
+                        "pin_memory", self._is_gpu()
+                    ),
+                    persistent_workers=self._init_kwargs["data"].get(
+                        "persistent_workers", False
+                    ),
                     shuffle_train=False,
                     shuffle_eval=False,
                     dtype=self._init_kwargs["data"].get("dtype", torch.float),
                 ),
-                task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
-                        else "singletask_multivariate",
+                task_type="singletask_univariate"
+                if self._init_kwargs["model"].get("univariate", False)
+                else "singletask_multivariate",
             )
-            pred = self.trainers[i].predict_params(self.models[i], dm.predict_dataloader(), **kwargs)
+            pred = self.trainers[i].predict_params(
+                self.models[i], dm.predict_dataloader(), **kwargs
+            )
             if model_includes_mus:
-                out_betas.append(pred[0]); out_mus.append(pred[1])
+                out_betas.append(pred[0])
+                out_mus.append(pred[1])
             else:
                 out_betas.append(pred)
 
         if model_includes_mus:
-            betas = np.array(out_betas); mus = np.array(out_mus)
-            return (betas, mus) if individual_preds else (np.mean(betas, axis=0), np.mean(mus, axis=0))
+            betas = np.array(out_betas)
+            mus = np.array(out_mus)
+            return (
+                (betas, mus)
+                if individual_preds
+                else (np.mean(betas, axis=0), np.mean(mus, axis=0))
+            )
         else:
             betas = np.array(out_betas)
             return betas if individual_preds else np.mean(betas, axis=0)
@@ -612,7 +673,7 @@ class SKLearnWrapper:
         """
         self.models, self.trainers = [], []
 
-        # normalize argument order 
+        # normalize argument order
         C_in = kwargs.pop("C", None)
         X_in = kwargs.pop("X", None)
         Y_in = kwargs.pop("Y", None)
@@ -628,21 +689,29 @@ class SKLearnWrapper:
                     else:
                         C, X, Y = A, B, Carg
                 else:
-                    raise ValueError("Mismatched sample counts among provided arrays.")
+                    raise ValueError(
+                        "Mismatched sample counts among provided arrays."
+                    )
             elif len(args) == 2:
                 A, B = args
                 if A.shape[0] != B.shape[0]:
-                    raise ValueError("Mismatched sample counts for two-argument fit.")
+                    raise ValueError(
+                        "Mismatched sample counts for two-argument fit."
+                    )
                 # Assume (C, X) by default
                 C, X, Y = A, B, None
             else:
-                raise ValueError("fit expects (C,X[,Y]) or (X,Y,C) or kw-only C=..., X=...")
+                raise ValueError(
+                    "fit expects (C,X[,Y]) or (X,Y,C) or kw-only C=..., X=..."
+                )
 
         # Optional scaling
         if self.normalize:
-            if self.scalers["C"] is None: self.scalers["C"] = StandardScaler().fit(C)
+            if self.scalers["C"] is None:
+                self.scalers["C"] = StandardScaler().fit(C)
             C = self.scalers["C"].transform(C)
-            if self.scalers["X"] is None: self.scalers["X"] = StandardScaler().fit(X)
+            if self.scalers["X"] is None:
+                self.scalers["X"] = StandardScaler().fit(X)
             X = self.scalers["X"].transform(X)
 
         self.context_dim = C.shape[-1]
@@ -652,7 +721,8 @@ class SKLearnWrapper:
             if len(Y.shape) == 1:
                 Y = np.expand_dims(Y, 1)
             if self.normalize and not np.array_equal(np.unique(Y), np.array([0, 1])):
-                if self.scalers["Y"] is None: self.scalers["Y"] = StandardScaler().fit(Y)
+                if self.scalers["Y"] is None:
+                    self.scalers["Y"] = StandardScaler().fit(Y)
                 Y = self.scalers["Y"].transform(Y)
             self.y_dim = Y.shape[-1]
             args = (C, X, Y)
@@ -661,7 +731,9 @@ class SKLearnWrapper:
             args = (C, X)
 
         organized = self._organize_and_expand_fit_kwargs(**kwargs)
-        self.n_bootstraps = organized["wrapper"].get("n_bootstraps", self.n_bootstraps)
+        self.n_bootstraps = organized["wrapper"].get(
+            "n_bootstraps", self.n_bootstraps
+        )
 
         n = C.shape[0]
         val_split = organized["data"].get("val_split", self.default_val_split)
@@ -676,25 +748,48 @@ class SKLearnWrapper:
 
             # Indices
             train_idx, val_idx = self._split_train_data(
-                C, X, (args[2] if len(args) == 3 else None),
+                C,
+                X,
+                (args[2] if len(args) == 3 else None),
                 Y_required=(len(args) == 3),
                 val_split=val_split,
             )
             test_idx = None
 
             # DataModule
-            task_type = "singletask_univariate" if organized["model"].get("univariate", False) else "singletask_multivariate"
+            task_type = (
+                "singletask_univariate"
+                if organized["model"].get("univariate", False)
+                else "singletask_multivariate"
+            )
             dm = self._build_datamodule(
-                C=args[0], X=args[1], Y=(args[2] if len(args) == 3 else None),
-                train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+                C=args[0],
+                X=args[1],
+                Y=(args[2] if len(args) == 3 else None),
+                train_idx=train_idx,
+                val_idx=val_idx,
+                test_idx=test_idx,
                 data_kwargs=dict(
-                    train_batch_size=organized["data"].get("train_batch_size", self.default_train_batch_size),
-                    val_batch_size=organized["data"].get("val_batch_size", self.default_val_batch_size),
-                    test_batch_size=organized["data"].get("test_batch_size", self.default_test_batch_size),
-                    predict_batch_size=organized["data"].get("predict_batch_size", self.default_val_batch_size),
+                    train_batch_size=organized["data"].get(
+                        "train_batch_size", self.default_train_batch_size
+                    ),
+                    val_batch_size=organized["data"].get(
+                        "val_batch_size", self.default_val_batch_size
+                    ),
+                    test_batch_size=organized["data"].get(
+                        "test_batch_size", self.default_test_batch_size
+                    ),
+                    predict_batch_size=organized["data"].get(
+                        "predict_batch_size", self.default_val_batch_size
+                    ),
                     num_workers=organized["data"].get("num_workers", 0),
-                    pin_memory=organized["data"].get("pin_memory", self._is_gpu()),
-                    persistent_workers=organized["data"].get("persistent_workers", organized["data"].get("num_workers", 0) > 0),
+                    pin_memory=organized["data"].get(
+                        "pin_memory", self._is_gpu()
+                    ),
+                    persistent_workers=organized["data"].get(
+                        "persistent_workers",
+                        organized["data"].get("num_workers", 0) > 0,
+                    ),
                     drop_last=organized["data"].get("drop_last", False),
                     shuffle_train=organized["data"].get("shuffle_train", True),
                     shuffle_eval=organized["data"].get("shuffle_eval", False),
@@ -705,11 +800,14 @@ class SKLearnWrapper:
 
             # Trainer (fresh callbacks)
             trainer_kwargs = copy.deepcopy(organized["trainer"])
-            trainer_kwargs["callbacks"] = [f(b) for f in trainer_kwargs.get("callback_constructors", [])]
+            trainer_kwargs["callbacks"] = [
+                f(b) for f in trainer_kwargs.get("callback_constructors", [])
+            ]
             trainer_kwargs.pop("callback_constructors", None)
 
             # Build via factory (respects strategy strings and env)
             from contextualized.regression.trainers import make_trainer_with_env
+
             trainer = make_trainer_with_env(
                 self.trainer_constructor,
                 **trainer_kwargs,
@@ -737,8 +835,19 @@ class SKLearnWrapper:
 
             # Load best checkpoint if enabled
             if trainer_kwargs.get("enable_checkpointing", False):
-                ckpt_cb = next((cb for cb in trainer.callbacks if isinstance(cb, ModelCheckpoint)), None)
-                if ckpt_cb and ckpt_cb.best_model_path and os.path.exists(ckpt_cb.best_model_path):
+                ckpt_cb = next(
+                    (
+                        cb
+                        for cb in trainer.callbacks
+                        if isinstance(cb, ModelCheckpoint)
+                    ),
+                    None,
+                )
+                if (
+                    ckpt_cb
+                    and ckpt_cb.best_model_path
+                    and os.path.exists(ckpt_cb.best_model_path)
+                ):
                     best = torch.load(ckpt_cb.best_model_path, map_location="cpu")
                     model.load_state_dict(best["state_dict"])
 
