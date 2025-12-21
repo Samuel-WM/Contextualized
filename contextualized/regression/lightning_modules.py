@@ -276,8 +276,111 @@ class ContextualizedRegressionBase(pl.LightningModule):
         return loss
 
     def _predict_from_models(self, X, beta_hat, mu_hat):
-        # fused reduction + keepdim avoids extra unsqueeze
-        return self.link_fn((beta_hat * X).sum(dim=-1, keepdim=True) + mu_hat)
+        """
+        Make shapes consistent before computing:
+            y = g( (beta ⊙ X).sum(-1, keepdim=True) + mu )
+
+        Expected canonical shapes:
+          - beta_hat: (B, y_dim, x_dim)
+          - mu_hat:   (B, y_dim, 1) or (B, y_dim)
+          - X: one of
+              * (B, x_dim)
+              * (B, 1, x_dim)
+              * (B, y_dim, x_dim)
+
+        We also accept beta_hat/mu_hat with an extra trailing singleton dim:
+          * (B, y_dim, x_dim, 1)  -> squeeze to (B, y_dim, x_dim)
+        """
+
+        # ---- Normalize beta_hat to (B, y_dim, x_dim) ----
+        if not isinstance(beta_hat, torch.Tensor):
+            raise RuntimeError(
+                f"beta_hat must be a tensor, got {type(beta_hat)}"
+            )
+
+        # Handle univariate case where shape is (B, y, x, 1)
+        if beta_hat.dim() == 4 and beta_hat.shape[-1] == 1:
+            beta_hat = beta_hat.squeeze(-1)
+
+        if beta_hat.dim() != 3:
+            raise RuntimeError(
+                f"_predict_from_models expects beta_hat with shape (B, y, x) "
+                f"or (B, y, x, 1); got {beta_hat.shape}"
+            )
+
+        B, y_dim, x_dim = beta_hat.shape
+
+        # ---- Move and normalize X ----
+        if not isinstance(X, torch.Tensor):
+            X = torch.as_tensor(X, device=beta_hat.device, dtype=beta_hat.dtype)
+        else:
+            X = X.to(device=beta_hat.device, dtype=beta_hat.dtype)
+
+        if X.dim() == 2:
+            # (B, x_dim) -> broadcast over y_dim
+            if X.shape[0] != B:
+                raise RuntimeError(
+                    f"X batch dim {X.shape[0]} != beta_hat batch dim {B}. "
+                    f"X.shape={X.shape}, beta_hat.shape={beta_hat.shape}"
+                )
+            if X.shape[1] != x_dim:
+                raise RuntimeError(
+                    f"X feature dim {X.shape[1]} != x_dim {x_dim}. "
+                    f"X.shape={X.shape}, beta_hat.shape={beta_hat.shape}"
+                )
+            X = X.unsqueeze(1).expand(-1, y_dim, -1)
+
+        elif X.dim() == 3:
+            if X.shape[0] != B:
+                raise RuntimeError(
+                    f"X batch dim {X.shape[0]} != beta_hat batch dim {B}. "
+                    f"X.shape={X.shape}, beta_hat.shape={beta_hat.shape}"
+                )
+
+            if X.shape[1] == y_dim and X.shape[2] == x_dim:
+                pass  # already good
+            elif X.shape[1] == 1 and X.shape[2] == x_dim:
+                X = X.expand(-1, y_dim, -1)  # (B,1,x) -> (B,y,x)
+            elif X.shape[1] == x_dim and X.shape[2] == y_dim and x_dim == y_dim:
+                X = X.permute(0, 2, 1)       # (B,x,y) -> (B,y,x)
+            else:
+                raise RuntimeError(
+                    f"Unexpected X shape {X.shape} for beta_hat {beta_hat.shape}. "
+                    "Cannot safely align dimensions."
+                )
+        else:
+            raise RuntimeError(
+                f"Unsupported X.ndim={X.dim()} for _predict_from_models; "
+                f"expected 2 or 3. X.shape={X.shape}, beta_hat.shape={beta_hat.shape}"
+            )
+
+        # ---- Normalize mu_hat to broadcast correctly ----
+        if not isinstance(mu_hat, torch.Tensor):
+            mu_hat = torch.as_tensor(mu_hat, device=beta_hat.device, dtype=beta_hat.dtype)
+        else:
+            mu_hat = mu_hat.to(device=beta_hat.device, dtype=beta_hat.dtype)
+
+        # Handle univariate case where mu_hat is (B, y, x, 1)
+        if mu_hat.dim() == 4 and mu_hat.shape[-1] == 1:
+            mu_hat = mu_hat.squeeze(-1)
+
+        if mu_hat.dim() == 2:
+            # (B, y_dim) -> (B, y_dim, 1)
+            mu_hat = mu_hat.unsqueeze(-1)
+        elif mu_hat.dim() == 3:
+            # assume already (B, y_dim, 1) or (B, y_dim, x_dim)
+            pass
+        else:
+            raise RuntimeError(
+                f"Unsupported mu_hat.ndim={mu_hat.dim()} in _predict_from_models; "
+                f"mu_hat.shape={mu_hat.shape}"
+            )
+
+        out = (beta_hat * X).sum(dim=-1, keepdim=True) + mu_hat
+        return self.link_fn(out)
+
+
+
 
 
     def _predict_y(self, C, X, beta_hat, mu_hat):
@@ -1345,4 +1448,3 @@ class ContextualizedMarkovGraph(ContextualizedRegression):
             "mus": mu_hat,
         })
         return batch
-

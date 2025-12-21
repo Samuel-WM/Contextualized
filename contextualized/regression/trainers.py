@@ -154,58 +154,25 @@ class MarkovTrainer(CorrelationTrainer):
 
 
 
-# ADD THIS FACTORY (end of file)
+def choose_lightning_environment() -> LightningEnvironment:
+    # If you have a custom Environment subclass, wire it here.
+    # Otherwise, the default LightningEnvironment is fine.
+    return LightningEnvironment()
 
-# at top of file you already have:
-# from pytorch_lightning.plugins.environments import LightningEnvironment
+def make_trainer_with_env(trainer_cls, **trainer_kwargs):
+    """
+    Factory that respects caller-provided `devices` and `strategy`.
+    FIXED: Don't inject LightningEnvironment when torchrun is managing processes.
+    """
+    import os
+    
+    # Check if we're under torchrun (WORLD_SIZE > 1 means torchrun is managing)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    
+    # Only inject LightningEnvironment for single-process runs
+    # When torchrun is active, Lightning will auto-detect TorchElasticEnvironment
+    if "plugins" not in trainer_kwargs and world_size == 1:
+        env = choose_lightning_environment()
+        trainer_kwargs["plugins"] = [env]
 
-from contextualized.utils.engine import pick_engine
-
-
-from pytorch_lightning.strategies import DDPStrategy, Strategy as PLStrategy
-
-def make_trainer_with_env(trainer_cls=RegressionTrainer, **kwargs) -> pl.Trainer:
-    # Respect explicit user settings; otherwise auto-pick
-    accelerator = kwargs.pop("accelerator", None)
-    devices     = kwargs.pop("devices", None)
-    strategy    = kwargs.pop("strategy", None)
-    plugins     = kwargs.pop("plugins", None)
-
-    # If caller provided a concrete Strategy instance, pass it through verbatim
-    if isinstance(strategy, PLStrategy):
-        return trainer_cls(
-            accelerator=("cpu" if accelerator is None else accelerator),
-            devices=(1 if devices is None else devices),
-            strategy=strategy,
-            plugins=plugins,
-            **kwargs,
-        )
-
-    # Otherwise, select engines automatically
-    accelerator, devices, strategy_name = pick_engine(
-        accelerator=accelerator,
-        devices=devices,
-        strategy=strategy,    # may be "ddp" or "auto"
-        prefer_spawn=True,    # allows plain `python script.py` to use all GPUs
-    )
-
-    # Upgrade "ddp" string to tuned DDPStrategy
-    if strategy_name == "ddp":
-        strategy_obj = DDPStrategy(
-            find_unused_parameters=False,
-            static_graph=True,
-            gradient_as_bucket_view=True,
-        )
-    else:
-        strategy_obj = strategy_name  # "auto" or other strings
-
-    if plugins is None and accelerator == "cpu":
-        plugins = [LightningEnvironment()]
-
-    return trainer_cls(
-        accelerator=accelerator,
-        devices=devices,
-        strategy=strategy_obj,
-        plugins=plugins,
-        **kwargs,
-    )
+    return trainer_cls(**trainer_kwargs)

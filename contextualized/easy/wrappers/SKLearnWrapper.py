@@ -4,12 +4,13 @@ import os
 from typing import *
 import numpy as np
 import torch
+import torch.distributed as dist
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.plugins.environments import LightningEnvironment
-from pytorch_lightning.strategies import DDPStrategy  # PL v1 Strategy API (not strictly required here)
+from pytorch_lightning.strategies import DDPStrategy
 
 from contextualized.functions import LINK_FUNCTIONS
 from contextualized.regression import REGULARIZERS, LOSSES
@@ -19,7 +20,7 @@ DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_N_BOOTSTRAPS = 1
 DEFAULT_ES_PATIENCE = 1
 DEFAULT_VAL_BATCH_SIZE = 16
-DEFAULT_TRAIN_BATCH_SIZE = 1
+DEFAULT_TRAIN_BATCH_SIZE = 64
 DEFAULT_TEST_BATCH_SIZE = 16
 DEFAULT_VAL_SPLIT = 0.2
 DEFAULT_ENCODER_TYPE = "mlp"
@@ -29,19 +30,52 @@ DEFAULT_ENCODER_LINK_FN = LINK_FUNCTIONS["identity"]
 DEFAULT_NORMALIZE = False
 
 
+def _is_distributed() -> bool:
+    """Check if we're in a distributed context."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def _get_rank() -> int:
+    """Get current process rank."""
+    if _is_distributed():
+        return dist.get_rank()
+    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+
+
+def _is_main_process() -> bool:
+    """Check if this is the main process (rank 0)."""
+    return _get_rank() == 0
+
+
+def _gather_predictions(local_preds: np.ndarray, world_size: int) -> np.ndarray:
+    """
+    Gather predictions from all ranks to rank 0.
+    Returns full predictions on rank 0, None on other ranks.
+    """
+    if not _is_distributed() or world_size == 1:
+        return local_preds
+    
+    local_tensor = torch.from_numpy(local_preds).cuda()
+    
+    if _is_main_process():
+        gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+        dist.gather(local_tensor, gather_list=gathered, dst=0)
+        return torch.cat(gathered, dim=0).cpu().numpy()
+    else:
+        dist.gather(local_tensor, dst=0)
+        return None
+
+
 class SKLearnWrapper:
     """
     An sklearn-like wrapper for Contextualized models.
-
-    Args:
-        base_constructor (class): Base LightningModule constructor.
-        extra_model_kwargs (Iterable[str]): Extra model kwargs to accept.
-        extra_data_kwargs (Iterable[str]): Extra data kwargs to accept.
-        trainer_constructor (class): Trainer class (usually RegressionTrainer).
-        normalize (bool): If True, standardize C/X (and Y if continuous).
+    
+    FIXED VERSION with proper DDP handling for:
+    - Prediction (avoids duplicate computation)
+    - Data loading (proper num_workers)
+    - Distributed inference
     """
 
-    # -------------------- defaults --------------------
     def _set_defaults(self):
         self.default_learning_rate = DEFAULT_LEARNING_RATE
         self.default_n_bootstraps = DEFAULT_N_BOOTSTRAPS
@@ -68,9 +102,15 @@ class SKLearnWrapper:
         self.base_constructor = base_constructor
         self.trainer_constructor = trainer_constructor
 
+        self._trainer_init_kwargs = kwargs.pop("trainer_kwargs", None)
+
         self.n_bootstraps = 1
         self.models = None
         self.trainers = None
+        
+        # Track if we trained with DDP (affects prediction strategy)
+        self._trained_with_ddp = False
+        self._trained_devices = 1
 
         self.normalize = kwargs.pop("normalize", self.default_normalize)
         self.scalers = {"C": None, "X": None, "Y": None}
@@ -150,7 +190,6 @@ class SKLearnWrapper:
             "data", kwargs.pop("remove_data_kwargs", []), acceptable=False
         )
 
-        # Convenience aliases handled at construction
         self.convenience_kwargs = [
             "alpha",
             "l1_ratio",
@@ -161,7 +200,6 @@ class SKLearnWrapper:
             "encoder_link_fn",
         ]
 
-        # Model constructor kwargs (with convenience mapping)
         self.constructor_kwargs = self._organize_constructor_kwargs(**kwargs)
         self.constructor_kwargs["encoder_kwargs"]["width"] = kwargs.pop(
             "width", self.constructor_kwargs["encoder_kwargs"]["width"]
@@ -176,7 +214,6 @@ class SKLearnWrapper:
             ),
         )
 
-        # Everything else
         self.not_constructor_kwargs = {
             k: v
             for k, v in kwargs.items()
@@ -188,13 +225,12 @@ class SKLearnWrapper:
         )
         for k, v in self.constructor_kwargs.items():
             self._init_kwargs["model"][k] = v
+
+        if self._trainer_init_kwargs is not None:
+            self._init_kwargs["trainer"].update(self._trainer_init_kwargs)
+
         for kw in unrecognized:
             print(f"Received unknown keyword argument {kw}, probably ignoring.")
-
-    # -------------------- helpers --------------------
-
-    def _is_gpu(self) -> bool:
-        return self.accelerator in ("cuda", "gpu")
 
     def _update_acceptable_kwargs(self, category, new_kwargs, acceptable=True):
         if acceptable:
@@ -242,7 +278,6 @@ class SKLearnWrapper:
         if kwargs.get("subtype_probabilities", False):
             model["encoder_kwargs"]["link_fn"] = LINK_FUNCTIONS["softmax"]
 
-        # Regularizer
         if "model_regularizer" in self.acceptable_kwargs["model"]:
             if kwargs.get("alpha", 0) > 0:
                 model["model_regularizer"] = REGULARIZERS["l1_l2"](
@@ -276,19 +311,48 @@ class SKLearnWrapper:
                 min_delta=getattr(cb, "min_delta", 0.0),
             )
         return cb
+    
+    def _default_num_workers(self, devices: int) -> int:
+        """
+        Heuristic for default DataLoader workers.
+        FIXED: CPU also benefits from workers for I/O overlap.
+        """
+        try:
+            n_cpu = os.cpu_count() or 0
+        except Exception:
+            n_cpu = 0
 
-    # -------------------- fit kwarg expansion --------------------
+        if n_cpu <= 0:
+            return 0
+
+        # For CPU-only, still use some workers for data loading overlap
+        if self.accelerator not in ("cuda", "gpu"):
+            return min(2, n_cpu)
+
+        world_size_env = os.environ.get("WORLD_SIZE", None)
+        if world_size_env is not None:
+            try:
+                world_size = max(1, int(world_size_env))
+            except ValueError:
+                world_size = 1
+        else:
+            world_size = max(1, devices)
+
+        cpu_per_rank = max(1, n_cpu // world_size)
+        # 2-4 workers per rank, capped
+        return int(min(4, max(2, cpu_per_rank // 2)))
+
     def _organize_and_expand_fit_kwargs(self, **kwargs):
         """
-        Expand/normalize kwargs for data/model/trainer/wrapper/fit, and build a clean
-        configuration dict for downstream construction. Critically:
-        • Merge constructor-time defaults BEFORE computing use_val.
-        • Only add EarlyStopping if a val loop exists and patience > 0.
-        • Retarget or strip EarlyStopping if no val loop.
+        Expand/normalize kwargs for data/model/trainer/wrapper/fit.
+        FIXED: Better DDP defaults and tracking.
         """
         organized, unrecognized = self._organize_kwargs(**kwargs)
 
-        # -------- epochs (avoid PL default 1000) --------
+        for category, cat_kwargs in self._init_kwargs.items():
+            for k, v in cat_kwargs.items():
+                organized[category].setdefault(k, v)
+
         max_epochs_cli = kwargs.get("max_epochs", None)
         epochs_cli = kwargs.get("epochs", None)
         if max_epochs_cli is not None:
@@ -296,43 +360,82 @@ class SKLearnWrapper:
         elif epochs_cli is not None:
             organized["trainer"]["max_epochs"] = int(epochs_cli)
         else:
-            organized["trainer"]["max_epochs"] = 3
+            organized["trainer"].setdefault("max_epochs", 3)
 
-        # -------- merge constructor defaults BEFORE using them --------
-        for category, cat_kwargs in self._init_kwargs.items():
-            for k, v in cat_kwargs.items():
-                organized[category].setdefault(k, v)
-
-        # -------- world size / validation decision --------
-        world_size = int(os.getenv("WORLD_SIZE", "1"))
         current_val_split = organized["data"].get("val_split", self.default_val_split)
         organized["data"]["val_split"] = current_val_split
         use_val = float(current_val_split) > 0.0
 
-        # -------- trainer defaults --------
         organized["trainer"].setdefault("accelerator", self.accelerator)
         organized["trainer"].setdefault("enable_progress_bar", False)
         organized["trainer"].setdefault("logger", False)
         organized["trainer"].setdefault("enable_checkpointing", False)
         organized["trainer"].setdefault("num_sanity_val_steps", 0)
-        organized["trainer"].setdefault("precision", 32)
+        
+        # FIXED: Default to mixed precision on GPU
+        if self.accelerator in ("cuda", "gpu"):
+            organized["trainer"].setdefault("precision", "16-mixed")
+        else:
+            organized["trainer"].setdefault("precision", 32)
+
         if not use_val:
             organized["trainer"].setdefault("limit_val_batches", 0)
 
-        if world_size > 1:
-            organized["trainer"].setdefault("devices", world_size)
-            organized["trainer"].setdefault("strategy", "ddp")  # string to allow factory
-        else:
-            organized["trainer"]["devices"] = 1
-            organized["trainer"].setdefault("strategy", "auto")
-            organized["trainer"].setdefault("plugins", [LightningEnvironment()])
+        world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+        if "devices" not in organized["trainer"]:
+            # When torchrun is active, devices must match world_size
+            organized["trainer"]["devices"] = world_size_env if world_size_env > 1 else 1
 
-        # Helper to safely set defaults if the key is permitted for that category
+        devices_cfg = organized["trainer"].get("devices", 1)
+        if isinstance(devices_cfg, int):
+            devices = devices_cfg
+        elif isinstance(devices_cfg, (list, tuple)):
+            devices = len(devices_cfg)
+        else:
+            devices = 1
+        
+        # Validate: if torchrun sets WORLD_SIZE > 1, devices must match
+        if world_size_env > 1 and devices != world_size_env:
+            if _is_main_process():
+                print(f"[WARNING] torchrun WORLD_SIZE={world_size_env} but devices={devices}. "
+                      f"Overriding devices to {world_size_env}.")
+            devices = world_size_env
+            organized["trainer"]["devices"] = devices
+
+        # Track for prediction strategy
+        self._trained_devices = devices
+        self._trained_with_ddp = devices > 1
+
+        if "strategy" not in organized["trainer"]:
+            if devices > 1 or world_size_env > 1:
+                from datetime import timedelta
+                # Check if we're under torchrun (process group may already exist)
+                if world_size_env > 1:
+                    # torchrun case: let Lightning use existing process group
+                    organized["trainer"]["strategy"] = "ddp"
+                else:
+                    # Lightning-spawned DDP case
+                    organized["trainer"]["strategy"] = DDPStrategy(
+                        process_group_backend="nccl" if torch.cuda.is_available() else "gloo",
+                        find_unused_parameters=False,
+                        broadcast_buffers=False,
+                        timeout=timedelta(minutes=30),
+                    )
+            else:
+                organized["trainer"]["strategy"] = "auto"
+
+        if (
+            organized["trainer"].get("strategy") in ("auto", None)
+            and organized["trainer"].get("devices", 1) == 1
+            and world_size_env == 1  # Not under torchrun
+            and "plugins" not in organized["trainer"]
+        ):
+            organized["trainer"]["plugins"] = [LightningEnvironment()]
+
         def maybe_add(cat, k, default):
             if k in self.acceptable_kwargs[cat]:
                 organized[cat][k] = organized[cat].get(k, default)
 
-        # -------- model defaults --------
         maybe_add("model", "learning_rate", self.default_learning_rate)
         maybe_add("model", "context_dim", self.context_dim)
         maybe_add("model", "x_dim", self.x_dim)
@@ -340,40 +443,37 @@ class SKLearnWrapper:
         if organized["model"].get("num_archetypes", 1) == 0:
             organized["model"].pop("num_archetypes", None)
 
-        # -------- data defaults (per-loader sizes) --------
         maybe_add("data", "train_batch_size", self.default_train_batch_size)
         maybe_add("data", "val_batch_size", self.default_val_batch_size)
         maybe_add("data", "test_batch_size", self.default_test_batch_size)
         maybe_add("data", "predict_batch_size", self.default_val_batch_size)
-        maybe_add("data", "num_workers", 0)
-        maybe_add("data", "pin_memory", self._is_gpu())
-        maybe_add(
-            "data",
-            "persistent_workers",
-            organized["data"].get("num_workers", 0) > 0,
-        )
-        maybe_add("data", "drop_last", False)
+
+        # FIXED: Better num_workers default
+        default_nw = self._default_num_workers(devices)
+        maybe_add("data", "num_workers", default_nw)
+
+        maybe_add("data", "pin_memory", self.accelerator in ("cuda", "gpu"))
+
+        persistent_default = organized["data"].get("num_workers", 0) > 0
+        maybe_add("data", "persistent_workers", persistent_default)
+
+        drop_last_default = devices > 1
+        maybe_add("data", "drop_last", drop_last_default)
+
         maybe_add("data", "shuffle_train", True)
         maybe_add("data", "shuffle_eval", False)
         maybe_add("data", "dtype", torch.float)
 
-        # -------- wrapper defaults --------
         maybe_add("wrapper", "n_bootstraps", self.default_n_bootstraps)
 
-        # -------- EarlyStopping / Checkpoint constructors --------
-        es_monitor = organized["wrapper"].get(
-            "es_monitor", "val_loss" if use_val else "train_loss"
-        )
+        es_monitor = organized["wrapper"].get("es_monitor", "val_loss" if use_val else "train_loss")
         es_mode = organized["wrapper"].get("es_mode", "min")
-        es_patience = organized["wrapper"].get(
-            "es_patience", self.default_es_patience
-        )
+        es_patience = organized["wrapper"].get("es_patience", self.default_es_patience)
         es_verbose = organized["wrapper"].get("es_verbose", False)
         es_min_delta = organized["wrapper"].get("es_min_delta", 0.0)
 
         cb_ctors = organized["trainer"].get("callback_constructors", [])
 
-        # Only add EarlyStopping when there is a val loop AND patience > 0
         if use_val and (es_patience is not None and es_patience > 0):
             cb_ctors.append(
                 lambda i: EarlyStopping(
@@ -390,41 +490,30 @@ class SKLearnWrapper:
                 lambda i: ModelCheckpoint(
                     monitor=("val_loss" if use_val else None),
                     dirpath=f"{kwargs.get('checkpoint_path', './lightning_logs')}/boot_{i}_checkpoints",
-                    filename=(
-                        "{epoch}-{val_loss:.4f}" if use_val else "{epoch}"
-                    ),
+                    filename=("{epoch}-{val_loss:.4f}" if use_val else "{epoch}"),
                 )
             )
         organized["trainer"]["callback_constructors"] = cb_ctors
 
-        # -------- unknown kw logging --------
         for kw in unrecognized:
             print(f"Received unknown keyword argument {kw}, probably ignoring.")
 
-        # -------- sanitize any pre-specified callbacks for no-val runs --------
         cb_list = organized["trainer"].get("callbacks", [])
-        cb_list = [
-            self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list
-        ]
+        cb_list = [self._retarget_or_strip_early_stopping(cb, use_val) for cb in cb_list]
         organized["trainer"]["callbacks"] = cb_list
 
-        # Also sanitize dynamically constructed callbacks
         ctor_list = organized["trainer"].get("callback_constructors", [])
 
         def _wrap_ctor(ctor):
             def _wrapped(i):
                 cb = ctor(i)
                 return self._retarget_or_strip_early_stopping(cb, use_val)
-
             return _wrapped
 
-        organized["trainer"]["callback_constructors"] = [
-            _wrap_ctor(c) for c in ctor_list
-        ]
+        organized["trainer"]["callback_constructors"] = [_wrap_ctor(c) for c in ctor_list]
 
         return organized
 
-    # -------------------- data module builder --------------------
     def _build_datamodule(
         self,
         C: np.ndarray,
@@ -444,8 +533,8 @@ class SKLearnWrapper:
             test_batch_size=self.default_test_batch_size,
             predict_batch_size=self.default_val_batch_size,
             num_workers=0,
-            pin_memory=self._is_gpu(),
-            persistent_workers=None,  # <-- only once
+            pin_memory=(self.accelerator in ("cuda", "gpu")),
+            persistent_workers=False,
             drop_last=False,
             shuffle_train=True,
             shuffle_eval=False,
@@ -453,10 +542,6 @@ class SKLearnWrapper:
         )
         if data_kwargs:
             dk.update(data_kwargs)
-
-        # If not explicitly set, default to True when num_workers > 0
-        if dk["persistent_workers"] is None:
-            dk["persistent_workers"] = bool(dk["num_workers"] > 0)
 
         dm = ContextualizedRegressionDataModule(
             C=C,
@@ -479,11 +564,8 @@ class SKLearnWrapper:
             shuffle_eval=dk["shuffle_eval"],
             dtype=dk["dtype"],
         )
-        dm.prepare_data()
-        dm.setup()
         return dm
 
-    # -------------------- split helpers --------------------
     def _split_train_data(
         self,
         C: np.ndarray,
@@ -496,9 +578,7 @@ class SKLearnWrapper:
         shuffle: bool = True,
         **_,
     ):
-        """
-        Return (train_idx, val_idx) over rows; Lightning will attach DistributedSamplers.
-        """
+        """Return (train_idx, val_idx) over rows."""
         if Y_required and Y is None:
             raise ValueError("Y is required but was not provided.")
         n = C.shape[0]
@@ -506,6 +586,19 @@ class SKLearnWrapper:
         if vs <= 0.0:
             idx = np.arange(n)
             return idx, None
+        
+        # FIXED: Handle small datasets
+        min_val_samples = max(1, int(n * vs))
+        if min_val_samples < 2:
+            # Too small for validation split
+            idx = np.arange(n)
+            return idx, None
+        
+        # CRITICAL FIX: Use deterministic random_state for DDP
+        # All ranks MUST get the same train/val split
+        if random_state is None:
+            random_state = 42  # Fixed seed for reproducibility across ranks
+            
         tr_idx, va_idx = train_test_split(
             np.arange(n),
             test_size=vs,
@@ -514,7 +607,6 @@ class SKLearnWrapper:
         )
         return tr_idx, va_idx
 
-    # -------------------- optional scaling --------------------
     def _maybe_scale_C(self, C: np.ndarray) -> np.ndarray:
         if self.normalize and self.scalers["C"] is not None:
             return self.scalers["C"].transform(C)
@@ -525,62 +617,88 @@ class SKLearnWrapper:
             return self.scalers["X"].transform(X)
         return X
 
-    # -------------------- public API --------------------
-    def predict(
-        self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
-    ):
+    def _get_inference_device(self) -> torch.device:
+        """
+        Get the device to use for inference.
+        FIXED: Always use single device for prediction to avoid DDP complexity.
+        """
+        if self.accelerator in ("cuda", "gpu") and torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
+        """
+        FIXED: Proper single-device inference that works after DDP training.
+        """
         if not hasattr(self, "models") or self.models is None:
-            raise ValueError(
-                "Trying to predict with a model that hasn't been trained yet."
-            )
+            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
 
         Cq = self._maybe_scale_C(C)
         Xq = self._maybe_scale_X(X)
         Yq = np.zeros((len(Cq), self.y_dim), dtype=np.float32)
 
+        # FIXED: Use single device for inference
+        device = self._get_inference_device()
+
+        # Build dataloader without distributed sampler
+        dm = self._build_datamodule(
+            C=Cq,
+            X=Xq,
+            Y=Yq,
+            predict_idx=np.arange(len(Cq)),
+            data_kwargs=dict(
+                train_batch_size=self._init_kwargs["data"].get("train_batch_size", self.default_train_batch_size),
+                val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
+                test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
+                predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
+                num_workers=0,  # Single-threaded for inference simplicity
+                pin_memory=False,
+                persistent_workers=False,
+                shuffle_train=False,
+                shuffle_eval=False,
+                dtype=self._init_kwargs["data"].get("dtype", torch.float),
+            ),
+            task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
+                    else "singletask_multivariate",
+        )
+        
+        # Setup the datamodule
+        dm.setup(stage="predict")
+        pred_loader = dm.predict_dataloader()
+
         preds = []
         for i in range(len(self.models)):
-            dm = self._build_datamodule(
-                C=Cq,
-                X=Xq,
-                Y=Yq,
-                predict_idx=np.arange(len(Cq)),
-                data_kwargs=dict(
-                    train_batch_size=self._init_kwargs["data"].get(
-                        "train_batch_size", self.default_train_batch_size
-                    ),
-                    val_batch_size=self._init_kwargs["data"].get(
-                        "val_batch_size", self.default_val_batch_size
-                    ),
-                    test_batch_size=self._init_kwargs["data"].get(
-                        "test_batch_size", self.default_test_batch_size
-                    ),
-                    predict_batch_size=self._init_kwargs["data"].get(
-                        "predict_batch_size", self.default_val_batch_size
-                    ),
-                    num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get(
-                        "pin_memory", self._is_gpu()
-                    ),
-                    persistent_workers=self._init_kwargs["data"].get(
-                        "persistent_workers", False
-                    ),
-                    shuffle_train=False,
-                    shuffle_eval=False,
-                    dtype=self._init_kwargs["data"].get("dtype", torch.float),
-                ),
-                task_type="singletask_univariate"
-                if self._init_kwargs["model"].get("univariate", False)
-                else "singletask_multivariate",
-            )
-            yhat = self.trainers[i].predict_y(
-                self.models[i], dm.predict_dataloader(), **kwargs
-            )
+            model = self.models[i]
+            model.eval()
+            model.to(device)
+
+            out_batches = []
+            with torch.no_grad():
+                for b_idx, batch in enumerate(pred_loader):
+                    # Move batch to device
+                    batch = {
+                        k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                        for k, v in batch.items()
+                    }
+                    
+                    out = model.predict_step(batch, b_idx)
+
+                    Cb = out.get("contexts")
+                    Xb = out.get("predictors")
+                    betas = out["betas"]
+                    mus = out["mus"]
+
+                    yb = model._predict_y(Cb, Xb, betas, mus)
+                    out_batches.append(yb.detach().cpu())
+
+            yhat = torch.cat(out_batches, dim=0).numpy()
             preds.append(yhat)
 
         predictions = np.array(preds)
+
         if not individual_preds:
             predictions = np.mean(predictions, axis=0)
+
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
                 predictions = np.array(
@@ -588,6 +706,7 @@ class SKLearnWrapper:
                 )
             else:
                 predictions = self.scalers["Y"].inverse_transform(predictions)
+
         return predictions
 
     def predict_params(
@@ -597,67 +716,81 @@ class SKLearnWrapper:
         model_includes_mus: bool = True,
         **kwargs,
     ):
+        """
+        FIXED: Proper single-device inference for parameter prediction.
+        """
         if not hasattr(self, "models") or self.models is None:
-            raise ValueError(
-                "Trying to predict with a model that hasn't been trained yet."
-            )
+            raise ValueError("Trying to predict with a model that hasn't been trained yet.")
 
         Cq = self._maybe_scale_C(C)
         X_zero = np.zeros((len(Cq), self.x_dim), dtype=np.float32)
         Y_zero = np.zeros((len(Cq), self.y_dim), dtype=np.float32)
 
+        uses_y = kwargs.pop("uses_y", True)
+        device = self._get_inference_device()
+
+        dm = self._build_datamodule(
+            C=Cq,
+            X=X_zero,
+            Y=Y_zero if uses_y else None,
+            predict_idx=np.arange(len(Cq)),
+            data_kwargs=dict(
+                train_batch_size=self._init_kwargs["data"].get("train_batch_size", self.default_train_batch_size),
+                val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
+                test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
+                predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
+                num_workers=0,
+                pin_memory=False,
+                persistent_workers=False,
+                shuffle_train=False,
+                shuffle_eval=False,
+                dtype=self._init_kwargs["data"].get("dtype", torch.float),
+            ),
+            task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
+                    else "singletask_multivariate",
+        )
+        
+        dm.setup(stage="predict")
+        pred_loader = dm.predict_dataloader()
+
         out_betas, out_mus = [], []
+
         for i in range(len(self.models)):
-            dm = self._build_datamodule(
-                C=Cq,
-                X=X_zero,
-                Y=Y_zero if kwargs.pop("uses_y", True) else None,
-                predict_idx=np.arange(len(Cq)),
-                data_kwargs=dict(
-                    train_batch_size=self._init_kwargs["data"].get(
-                        "train_batch_size", self.default_train_batch_size
-                    ),
-                    val_batch_size=self._init_kwargs["data"].get(
-                        "val_batch_size", self.default_val_batch_size
-                    ),
-                    test_batch_size=self._init_kwargs["data"].get(
-                        "test_batch_size", self.default_test_batch_size
-                    ),
-                    predict_batch_size=self._init_kwargs["data"].get(
-                        "predict_batch_size", self.default_val_batch_size
-                    ),
-                    num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                    pin_memory=self._init_kwargs["data"].get(
-                        "pin_memory", self._is_gpu()
-                    ),
-                    persistent_workers=self._init_kwargs["data"].get(
-                        "persistent_workers", False
-                    ),
-                    shuffle_train=False,
-                    shuffle_eval=False,
-                    dtype=self._init_kwargs["data"].get("dtype", torch.float),
-                ),
-                task_type="singletask_univariate"
-                if self._init_kwargs["model"].get("univariate", False)
-                else "singletask_multivariate",
-            )
-            pred = self.trainers[i].predict_params(
-                self.models[i], dm.predict_dataloader(), **kwargs
-            )
+            model = self.models[i]
+            model.eval()
+            model.to(device)
+
+            beta_batches, mu_batches = [], []
+
+            with torch.no_grad():
+                for b_idx, batch in enumerate(pred_loader):
+                    batch = {
+                        k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                        for k, v in batch.items()
+                    }
+                    out = model.predict_step(batch, b_idx)
+
+                    betas_b = out["betas"].detach().cpu()
+                    beta_batches.append(betas_b)
+
+                    if model_includes_mus:
+                        mus_b = out["mus"].detach().cpu()
+                        mu_batches.append(mus_b)
+
+            betas_i = torch.cat(beta_batches, dim=0).numpy()
             if model_includes_mus:
-                out_betas.append(pred[0])
-                out_mus.append(pred[1])
+                mus_i = torch.cat(mu_batches, dim=0).numpy()
+                out_betas.append(betas_i)
+                out_mus.append(mus_i)
             else:
-                out_betas.append(pred)
+                out_betas.append(betas_i)
 
         if model_includes_mus:
             betas = np.array(out_betas)
             mus = np.array(out_mus)
-            return (
-                (betas, mus)
-                if individual_preds
-                else (np.mean(betas, axis=0), np.mean(mus, axis=0))
-            )
+            if individual_preds:
+                return betas, mus
+            return np.mean(betas, axis=0), np.mean(mus, axis=0)
         else:
             betas = np.array(out_betas)
             return betas if individual_preds else np.mean(betas, axis=0)
@@ -665,15 +798,11 @@ class SKLearnWrapper:
     def fit(self, *args, **kwargs) -> None:
         """
         Fit contextualized model to data.
-
-        Accepts either:
-          - (C, X, Y)  [canonical order], OR
-          - (X, Y, C)  [README order], OR
-          - kw-only: C=..., X=..., (Y=...)
+        FIXED: Proper DDP handling and device tracking.
         """
         self.models, self.trainers = [], []
 
-        # normalize argument order
+        # Normalize argument order 
         C_in = kwargs.pop("C", None)
         X_in = kwargs.pop("X", None)
         Y_in = kwargs.pop("Y", None)
@@ -689,21 +818,14 @@ class SKLearnWrapper:
                     else:
                         C, X, Y = A, B, Carg
                 else:
-                    raise ValueError(
-                        "Mismatched sample counts among provided arrays."
-                    )
+                    raise ValueError("Mismatched sample counts among provided arrays.")
             elif len(args) == 2:
                 A, B = args
                 if A.shape[0] != B.shape[0]:
-                    raise ValueError(
-                        "Mismatched sample counts for two-argument fit."
-                    )
-                # Assume (C, X) by default
+                    raise ValueError("Mismatched sample counts for two-argument fit.")
                 C, X, Y = A, B, None
             else:
-                raise ValueError(
-                    "fit expects (C,X[,Y]) or (X,Y,C) or kw-only C=..., X=..."
-                )
+                raise ValueError("fit expects (C,X[,Y]) or (X,Y,C) or kw-only C=..., X=...")
 
         # Optional scaling
         if self.normalize:
@@ -731,65 +853,42 @@ class SKLearnWrapper:
             args = (C, X)
 
         organized = self._organize_and_expand_fit_kwargs(**kwargs)
-        self.n_bootstraps = organized["wrapper"].get(
-            "n_bootstraps", self.n_bootstraps
-        )
+        self.n_bootstraps = organized["wrapper"].get("n_bootstraps", self.n_bootstraps)
 
         n = C.shape[0]
         val_split = organized["data"].get("val_split", self.default_val_split)
         use_val = val_split > 0.0
 
         for b in range(self.n_bootstraps):
-            # Model (LightningModule)
+            # Model
             _model_kwargs = dict(organized["model"])
-            _model_kwargs.pop("univariate", None)  # handled via task_type below
+            _model_kwargs.pop("univariate", None)
             model = self.base_constructor(**_model_kwargs)
             self.model_ = model
 
             # Indices
             train_idx, val_idx = self._split_train_data(
-                C,
-                X,
-                (args[2] if len(args) == 3 else None),
+                C, X, (args[2] if len(args) == 3 else None),
                 Y_required=(len(args) == 3),
                 val_split=val_split,
             )
+            print(f"[RANK {os.environ.get('RANK', 0)}] train_idx[:5]={train_idx[:5]}, val_idx[:5]={val_idx[:5] if val_idx is not None else None}")
+
             test_idx = None
 
             # DataModule
-            task_type = (
-                "singletask_univariate"
-                if organized["model"].get("univariate", False)
-                else "singletask_multivariate"
-            )
+            task_type = "singletask_univariate" if organized["model"].get("univariate", False) else "singletask_multivariate"
             dm = self._build_datamodule(
-                C=args[0],
-                X=args[1],
-                Y=(args[2] if len(args) == 3 else None),
-                train_idx=train_idx,
-                val_idx=val_idx,
-                test_idx=test_idx,
+                C=args[0], X=args[1], Y=(args[2] if len(args) == 3 else None),
+                train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
                 data_kwargs=dict(
-                    train_batch_size=organized["data"].get(
-                        "train_batch_size", self.default_train_batch_size
-                    ),
-                    val_batch_size=organized["data"].get(
-                        "val_batch_size", self.default_val_batch_size
-                    ),
-                    test_batch_size=organized["data"].get(
-                        "test_batch_size", self.default_test_batch_size
-                    ),
-                    predict_batch_size=organized["data"].get(
-                        "predict_batch_size", self.default_val_batch_size
-                    ),
+                    train_batch_size=organized["data"].get("train_batch_size", self.default_train_batch_size),
+                    val_batch_size=organized["data"].get("val_batch_size", self.default_val_batch_size),
+                    test_batch_size=organized["data"].get("test_batch_size", self.default_test_batch_size),
+                    predict_batch_size=organized["data"].get("predict_batch_size", self.default_val_batch_size),
                     num_workers=organized["data"].get("num_workers", 0),
-                    pin_memory=organized["data"].get(
-                        "pin_memory", self._is_gpu()
-                    ),
-                    persistent_workers=organized["data"].get(
-                        "persistent_workers",
-                        organized["data"].get("num_workers", 0) > 0,
-                    ),
+                    pin_memory=organized["data"].get("pin_memory", self.accelerator in ("cuda", "gpu")),
+                    persistent_workers=organized["data"].get("persistent_workers", False),
                     drop_last=organized["data"].get("drop_last", False),
                     shuffle_train=organized["data"].get("shuffle_train", True),
                     shuffle_eval=organized["data"].get("shuffle_eval", False),
@@ -798,56 +897,36 @@ class SKLearnWrapper:
                 task_type=task_type,
             )
 
-            # Trainer (fresh callbacks)
+            # Trainer
             trainer_kwargs = copy.deepcopy(organized["trainer"])
-            trainer_kwargs["callbacks"] = [
-                f(b) for f in trainer_kwargs.get("callback_constructors", [])
-            ]
+            trainer_kwargs["callbacks"] = [f(b) for f in trainer_kwargs.get("callback_constructors", [])]
             trainer_kwargs.pop("callback_constructors", None)
 
-            # Build via factory (respects strategy strings and env)
             from contextualized.regression.trainers import make_trainer_with_env
-
             trainer = make_trainer_with_env(
                 self.trainer_constructor,
                 **trainer_kwargs,
             )
 
-            # Ensure checkpoint dir if used
             for cb in trainer_kwargs.get("callbacks", []):
                 if isinstance(cb, ModelCheckpoint):
                     os.makedirs(cb.dirpath, exist_ok=True)
 
-            # Fit (omit val loader if no val split)
-            if use_val and dm.val_dataloader() is not None:
-                trainer.fit(
-                    model,
-                    train_dataloaders=dm.train_dataloader(),
-                    val_dataloaders=dm.val_dataloader(),
-                    **organized["fit"],
-                )
-            else:
-                trainer.fit(
-                    model,
-                    train_dataloaders=dm.train_dataloader(),
-                    **organized["fit"],
-                )
+            # Ensure all ranks have setup data before training
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            # Fit
+            trainer.fit(
+                model,
+                datamodule=dm,
+                **organized["fit"],
+            )
 
             # Load best checkpoint if enabled
             if trainer_kwargs.get("enable_checkpointing", False):
-                ckpt_cb = next(
-                    (
-                        cb
-                        for cb in trainer.callbacks
-                        if isinstance(cb, ModelCheckpoint)
-                    ),
-                    None,
-                )
-                if (
-                    ckpt_cb
-                    and ckpt_cb.best_model_path
-                    and os.path.exists(ckpt_cb.best_model_path)
-                ):
+                ckpt_cb = next((cb for cb in trainer.callbacks if isinstance(cb, ModelCheckpoint)), None)
+                if ckpt_cb and ckpt_cb.best_model_path and os.path.exists(ckpt_cb.best_model_path):
                     best = torch.load(ckpt_cb.best_model_path, map_location="cpu")
                     model.load_state_dict(best["state_dict"])
 

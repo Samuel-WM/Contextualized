@@ -170,12 +170,13 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             ds_cls = TASK_TO_DATASET[self.task_type]
 
             if Y_s is None:
-                raise ValueError(
-                    f"Y is required for regression task_type='{self.task_type}'. "
-                    "Pass a real Y array matching your task."
-                )
+                # Allow unsupervised / network-style usage where Y is omitted.
+                # In that case, use X as a dummy target so shapes line up.
+                # This mirrors the old CorrelationDataModule behavior (Y = X).
+                Y_s = X_s
 
             return ds_cls(C_s, X_s, Y_s, dtype=self.dtype)
+
 
 
         self.ds_train = _mk_dataset(self.train_idx)
@@ -233,4 +234,3 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             shuffle=False,
             **self._common_dl_kwargs(self.predict_batch_size),
         )
-

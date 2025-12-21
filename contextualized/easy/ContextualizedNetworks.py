@@ -2,9 +2,10 @@
 sklearn-like interface to Contextualized Networks.
 """
 
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
 
 import numpy as np
+import torch
 
 from contextualized.easy.wrappers import SKLearnWrapper
 from contextualized.regression.trainers import CorrelationTrainer, MarkovTrainer
@@ -27,10 +28,31 @@ class ContextualizedNetworks(SKLearnWrapper):
     """
 
     def _split_train_data(
-        self, C: np.ndarray, X: np.ndarray, **kwargs
-    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """Splits data into train and val sets (no Y for networks)."""
-        return super()._split_train_data(C, X, Y_required=False, **kwargs)
+        self,
+        C: np.ndarray,
+        X: np.ndarray,
+        Y: Optional[np.ndarray] = None,
+        *,
+        Y_required: bool = False,
+        val_split: Optional[float] = None,
+        random_state: Optional[int] = None,
+        shuffle: bool = True,
+        **kwargs,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Override only to change the default behavior (networks do not *require* Y),
+        but keep the signature compatible with SKLearnWrapper._split_train_data.
+        """
+        return super()._split_train_data(
+            C,
+            X,
+            Y,
+            Y_required=Y_required,
+            val_split=val_split,
+            random_state=random_state,
+            shuffle=shuffle,
+            **kwargs,
+        )
 
     def predict_networks(
         self,
@@ -83,13 +105,18 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
             Y=Y_zero,
             predict_idx=np.arange(len(C_scaled)),
             data_kwargs=dict(
-                batch_size=self._init_kwargs["data"].get("val_batch_size", 16),
+                train_batch_size=self._init_kwargs["data"].get("train_batch_size", 16),
+                val_batch_size=self._init_kwargs["data"].get("val_batch_size", 16),
+                test_batch_size=self._init_kwargs["data"].get("test_batch_size", 16),
+                predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", 16),
                 num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
+                pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
                 persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
-                shuffle_train=False, shuffle_eval=False,
+                shuffle_train=False,
+                shuffle_eval=False,
                 dtype=self._init_kwargs["data"].get("dtype", torch.float),
             ),
+
             task_type="singletask_univariate",  # correlation uses univariate convention
         )
         rhos = np.array([
@@ -105,18 +132,99 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False
     ) -> Union[np.ndarray, List[np.ndarray]]:
         """
-        Measures mean-squared reconstruction errors using (betas, mus).
+        Measures mean-squared reconstruction errors between the true X and the
+        reconstructed X_hat produced by the contextualized correlation network.
+
+        Parameters
+        ----------
+        C : np.ndarray
+            Context matrix of shape (N, C_dim).
+        X : np.ndarray
+            Data matrix of shape (N, F).
+        individual_preds : bool, default False
+            If False: return per-sample MSE averaged over bootstraps.
+            If True:  return per-bootstrap, per-sample MSE.
+
+        Returns
+        -------
+        np.ndarray
+            If individual_preds is False: shape (N_eff,), per-sample MSE averaged
+            over bootstraps.
+
+            If individual_preds is True: shape (B, N_eff), per-bootstrap, per-sample MSE.
+
+        Notes
+        -----
+        In single-process (non-distributed) settings, N_eff == N (full dataset).
+
+        Under distributed settings, predict_X may operate on rank-local shards so
+        the number of samples in X_hat (N_hat) may differ from len(X) (N_true).
+        In that case we align both X_hat and X to N_eff = min(N_hat, N_true) to
+        avoid shape mismatches, yielding valid MSEs for the evaluated subset.
         """
-        betas, mus = self.predict_networks(C, individual_preds=True, with_offsets=True)
-        mses = np.zeros((len(betas), len(C)))  # n_bootstraps x n_samples
-        F = X.shape[-1]
-        for i in range(F):
-            for j in range(F):
-                tiled_xi = np.array([X[:, i] for _ in range(len(betas))])
-                tiled_xj = np.array([X[:, j] for _ in range(len(betas))])
-                residuals = tiled_xi - betas[:, :, i, j] * tiled_xj - mus[:, :, i, j]
-                mses += residuals**2 / (F**2)
-        return mses if individual_preds else np.mean(mses, axis=0)
+        # Predict reconstructions of X for each bootstrap model
+        X_hat = self.predict_X(C, X, individual_preds=True)
+        X_hat = np.array(X_hat)
+
+        if X_hat.ndim not in (3, 4):
+            raise ValueError(
+                f"Unexpected X_hat ndim={X_hat.ndim} with shape {X_hat.shape} in "
+                "ContextualizedCorrelationNetworks.measure_mses"
+            )
+
+        # X: (N_true, F)
+        N_true, F = X.shape
+
+        if X_hat.ndim == 3:
+            # X_hat: (B, N_hat, F_hat)
+            B, N_hat, F_hat = X_hat.shape
+            if F_hat != F:
+                raise ValueError(
+                    f"Feature dimension mismatch between X_hat (F={F_hat}) and X (F={F}) "
+                    "in ContextualizedCorrelationNetworks.measure_mses"
+                )
+
+            # Align on the sample dimension
+            N_eff = min(N_hat, N_true)
+            if N_hat != N_true:
+                X_hat = X_hat[:, :N_eff, :]
+                X_eff = X[:N_eff, :]
+            else:
+                N_eff = N_true
+                X_eff = X
+
+            X_true = X_eff[None, :, :]          # (1, N_eff, F)
+            residuals = X_hat - X_true          # (B, N_eff, F)
+            mses = (residuals ** 2).mean(axis=-1)  # (B, N_eff)
+
+        else:  # X_hat.ndim == 4
+            # X_hat: (B, N_hat, F1, F2)
+            B, N_hat, F1, F2 = X_hat.shape
+            if F1 != F:
+                raise ValueError(
+                    f"Feature dimension mismatch between X_hat (F1={F1}) and X (F={F}) "
+                    "in ContextualizedCorrelationNetworks.measure_mses"
+                )
+
+            N_eff = min(N_hat, N_true)
+            if N_hat != N_true:
+                X_hat = X_hat[:, :N_eff, :, :]
+                X_eff = X[:N_eff, :]
+            else:
+                N_eff = N_true
+                X_eff = X
+
+            X_true = X_eff[None, :, :, None]    # (1, N_eff, F, 1)
+            residuals = X_hat - X_true          # (B, N_eff, F, F2)
+            mses = (residuals ** 2).mean(axis=(-1, -2))  # (B, N_eff)
+
+        # mses: (B, N_eff)
+        return mses if individual_preds else mses.mean(axis=0)
+
+
+
+
+
 
 
 class ContextualizedMarkovNetworks(ContextualizedNetworks):
@@ -141,13 +249,18 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
             Y=Y_zero,
             predict_idx=np.arange(len(C_scaled)),
             data_kwargs=dict(
-                batch_size=self._init_kwargs["data"].get("val_batch_size", 16),
+                train_batch_size=self._init_kwargs["data"].get("train_batch_size", 16),
+                val_batch_size=self._init_kwargs["data"].get("val_batch_size", 16),
+                test_batch_size=self._init_kwargs["data"].get("test_batch_size", 16),
+                predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", 16),
                 num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator == "gpu")),
+                pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
                 persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
-                shuffle_train=False, shuffle_eval=False,
+                shuffle_train=False,
+                shuffle_eval=False,
                 dtype=self._init_kwargs["data"].get("dtype", torch.float),
             ),
+
             task_type="singletask_univariate",
         )
         precisions = np.array([

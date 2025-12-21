@@ -47,4 +47,3 @@ class ContextualizedClassifier(ContextualizedRegressor):
         p1 = probs
         p0 = 1.0 - p1
         return np.stack([p0, p1], axis=-1)
-
