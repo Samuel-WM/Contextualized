@@ -2,25 +2,178 @@
 PyTorch-Lightning trainers used for Contextualized regression.
 """
 
-from typing import Any, Tuple, List
+from typing import Any, Tuple, List, Dict, Optional
 import numpy as np
 import torch
+import torch.distributed as dist
 import pytorch_lightning as pl
 from pytorch_lightning.plugins.environments import LightningEnvironment
 import os
 from pytorch_lightning.strategies import DDPStrategy
 
 
+
 def _stack_from_preds(preds: List[dict], key: str) -> torch.Tensor:
     """Concatenate a tensor field from the list of batch dicts returned by predict()."""
+    preds = _flatten_pl_predict_output(preds)
     parts = []
     for p in preds:
         val = p[key]
-        # ensure tensor on cpu
         if isinstance(val, np.ndarray):
             val = torch.from_numpy(val)
         parts.append(val.detach().cpu())
     return torch.cat(parts, dim=0)
+
+
+def _is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _is_main_process() -> bool:
+    return (not _is_distributed()) or dist.get_rank() == 0
+
+
+def _flatten_pl_predict_output(preds):
+    """
+    Lightning can return:
+      - list[dict]  (single dataloader)
+      - list[list[dict]] (multiple dataloaders)
+    Normalize to list[dict].
+    """
+    if preds is None:
+        return []
+    if len(preds) > 0 and isinstance(preds[0], list):
+        out = []
+        for sub in preds:
+            out.extend(sub)
+        return out
+    return preds
+
+
+def _to_numpy_cpu(x):
+    if x is None:
+        return None
+    if isinstance(x, np.ndarray):
+        return x
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _pack_keys_from_preds(preds: list, keys: Tuple[str, ...]) -> Dict[str, np.ndarray]:
+    """
+    Pack only requested keys from list[dict] predictions into numpy arrays.
+    Concats on axis 0.
+    """
+    preds = _flatten_pl_predict_output(preds)
+    if not preds:
+        return {}
+
+    packed: Dict[str, List[np.ndarray]] = {k: [] for k in keys}
+    for p in preds:
+        for k in keys:
+            if k in p:
+                v = _to_numpy_cpu(p[k])
+                if v is not None:
+                    packed[k].append(v)
+
+    out: Dict[str, np.ndarray] = {}
+    for k, parts in packed.items():
+        if not parts:
+            continue
+        out[k] = np.concatenate(parts, axis=0)
+    return out
+
+
+def _gather_object_to_rank0(obj):
+    """
+    Gather arbitrary Python objects to rank 0.
+    Returns list[obj] on rank 0, None on other ranks.
+    """
+    if not _is_distributed():
+        return [obj]
+
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return [obj]
+
+    if _is_main_process():
+        gathered = [None for _ in range(world_size)]
+        dist.gather_object(obj, object_gather_list=gathered, dst=0)
+        return gathered
+    else:
+        dist.gather_object(obj, object_gather_list=None, dst=0)
+        return None
+
+
+def _merge_packed_payloads(payloads: List[Optional[Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:
+    """
+    Merge list[dict[str, np.ndarray]] -> dict[str, np.ndarray] by concatenation axis 0.
+    """
+    merged: Dict[str, np.ndarray] = {}
+    payloads = [p for p in payloads if p]
+    if not payloads:
+        return merged
+
+    keys = set()
+    for p in payloads:
+        keys.update(p.keys())
+
+    for k in keys:
+        chunks = [p[k] for p in payloads if (k in p) and (p[k] is not None) and (len(p[k]) > 0)]
+        if not chunks:
+            continue
+        merged[k] = np.concatenate(chunks, axis=0)
+    return merged
+
+
+def _stable_sort_and_dedupe(payload: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    Sort payload arrays by dataset-local 'idx' when present (correct for subsets),
+    else fall back to 'orig_idx'. Then dedupe (DistributedSampler may pad/duplicate).
+    """
+    if not payload:
+        return payload
+
+    key = "idx" if "idx" in payload else ("orig_idx" if "orig_idx" in payload else None)
+    if key is None:
+        return payload
+
+    k = payload[key].astype(np.int64)
+    if k.size == 0:
+        return payload
+
+    order = np.argsort(k, kind="mergesort")
+    k_sorted = k[order]
+    _, uniq_pos = np.unique(k_sorted, return_index=True)
+    keep = order[np.sort(uniq_pos)]
+
+    out: Dict[str, np.ndarray] = {}
+    for name, v in payload.items():
+        if isinstance(v, np.ndarray) and v.shape[0] == k.shape[0]:
+            out[name] = v[keep]
+        else:
+            out[name] = v
+    return out
+
+
+
+def _gather_predict_payload(preds, keys: Tuple[str, ...]) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Packs requested keys from local preds, gathers to rank0 under DDP, merges, and
+    stable-sorts/dedupes by orig_idx (if present).
+    Returns payload dict on rank0; returns None on non-rank0 in DDP.
+    """
+    local = _pack_keys_from_preds(preds, keys)
+
+    gathered = _gather_object_to_rank0(local)
+    if gathered is None:
+        return None  # non-rank0 DDP
+
+    merged = _merge_packed_payloads(gathered)
+    merged = _stable_sort_and_dedupe(merged)
+    return merged
+
 
 
 class RegressionTrainer(pl.Trainer):
@@ -33,71 +186,80 @@ class RegressionTrainer(pl.Trainer):
 
     @torch.no_grad()
     def predict_params(self, model: pl.LightningModule, dataloader) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Returns context-specific regression parameters.
+        preds = super().predict(model, dataloader)
 
-        Returns
-        -------
-        (betas, mus)
-            betas: (n, y_dim, x_dim)
-            mus:   (n, y_dim) or (n, y_dim, 1) depending on the model
-        """
-        preds = super().predict(model, dataloader)  # list of batch dicts
-        betas = _stack_from_preds(preds, "betas")
-        mus   = _stack_from_preds(preds, "mus")
-        return betas.numpy(), mus.numpy()
+        payload = _gather_predict_payload(preds, keys=("idx", "orig_idx", "betas", "mus"))
+        if payload is None:
+            # non-rank0 DDP: return nothing to avoid duplicated outputs
+            return None, None
+
+
+        if "betas" not in payload or "mus" not in payload:
+            raise RuntimeError("predict_params: predict_step must return 'betas' and 'mus' (and ideally 'orig_idx').")
+
+        return payload["betas"], payload["mus"]
+
 
     @torch.no_grad()
     def predict_y(self, model: pl.LightningModule, dataloader) -> np.ndarray:
-        """
-        Returns context-specific predictions of the response Y.
+        preds = super().predict(model, dataloader)
 
-        Returns
-        -------
-        y_hat : (n, y_dim, 1) for multivariate, or (n, y_dim, x_dim) for univariate
-        """
-        preds = super().predict(model, dataloader)  # list of batch dicts
+        # Prefer lightweight gather, but allow legacy keys if present.
+        payload = _gather_predict_payload(preds, keys=("idx", "orig_idx", "betas", "mus"))
+        if payload is None:
+            return None  # non-rank0 DDP
 
-        y_parts = []
-        for p in preds:
-            # Required keys were added by model.predict_step(...)
-            C = p["contexts"]
-            X = p["predictors"]
-            betas = p["betas"]
-            mus = p["mus"]
+        if "betas" not in payload or "mus" not in payload:
+            raise RuntimeError("predict_y: predict_step must return 'betas' and 'mus'.")
 
-            # Ensure tensors on CPU first; model will move as needed inside helpers
-            if not torch.is_tensor(C):     C = torch.as_tensor(C)
-            if not torch.is_tensor(X):     X = torch.as_tensor(X)
-            if not torch.is_tensor(betas): betas = torch.as_tensor(betas)
-            if not torch.is_tensor(mus):   mus = torch.as_tensor(mus)
+        betas = torch.as_tensor(payload["betas"])
+        mus   = torch.as_tensor(payload["mus"])
 
-            # --- shape fixes for multivariate (3D) and univariate (4D) ---
-            # Multivariate convention: X (B, y, x), betas (B, y, x), mus (B, y, 1)
-            # Univariate convention:   X (B, y, x, 1), betas (B, y, x, 1), mus (B, y, x, 1)
+        # If legacy contexts/predictors were returned and gathered, use them.
+        if ("contexts" in payload) and ("predictors" in payload):
+            C = torch.as_tensor(payload["contexts"])
+            X = torch.as_tensor(payload["predictors"])
+        else:
+            # Option A path: reconstruct from dataset via dataset-local idx (NOT orig_idx)
+            ds = getattr(dataloader, "dataset", None)
+            if ds is None:
+                raise RuntimeError("predict_y: dataloader has no .dataset; cannot reconstruct C/X.")
 
-            # If X is (B, x) and betas is (B, y, x), expand X -> (B, 1, x)
-            if X.dim() == 2 and betas.dim() == 3 and betas.size(-1) == X.size(-1):
-                X = X.unsqueeze(1)
+            idx_np = payload["idx"].astype(np.int64)
+            idx_t = torch.as_tensor(idx_np, dtype=torch.long)
 
-            # If betas is (B, y, x) but X is (B, y, x, 1), add trailing singleton to betas
-            if betas.dim() == 3 and X.dim() == 4 and betas.size(-1) == X.size(-2):
-                betas = betas.unsqueeze(-1)
-                
+            # Support Subset wrapper if user wrapped loaders externally
+            if hasattr(ds, "dataset") and hasattr(ds, "indices"):
+                base = ds.dataset
+                if not (hasattr(base, "C") and hasattr(base, "X")):
+                    raise RuntimeError("predict_y: Subset base dataset must expose .C and .X.")
+                base_pos = np.asarray(ds.indices, dtype=np.int64)[idx_np]
+                base_pos_t = torch.as_tensor(base_pos, dtype=torch.long)
+                C = base.C[base_pos_t]
+                X = base.X[base_pos_t]
+            else:
+                if not (hasattr(ds, "C") and hasattr(ds, "X")):
+                    raise RuntimeError("predict_y: dataset must expose .C and .X tensors for Option A prediction.")
+                C = ds.C[idx_t]
+                X = ds.X[idx_t]
 
-            # Ensure mus trailing dim is singleton
-            if mus.dim() == 2:               # (B, y)
-                mus = mus.unsqueeze(-1)      # (B, y, 1)
-            elif mus.dim() == 3 and X.dim() == 4 and mus.size(-1) != 1:
-                mus = mus.unsqueeze(-1)      # (B, y, x, 1)
-            # --- end shape fixes ---
+            # dtype align
+            if torch.is_tensor(C):
+                C = C.to(dtype=betas.dtype)
+            else:
+                C = torch.as_tensor(C, dtype=betas.dtype)
+
+            if torch.is_tensor(X):
+                X = X.to(dtype=betas.dtype)
+            else:
+                X = torch.as_tensor(X, dtype=betas.dtype)
 
 
-            yhat = model._predict_y(C, X, betas, mus)  # uses model's link
-            y_parts.append(yhat.detach().cpu())
+        with torch.no_grad():
+            yhat = model._predict_y(C, X, betas, mus).detach().cpu().numpy()
 
-        y = torch.cat(y_parts, dim=0)
-        return y.numpy()
+        return yhat
+
 
 
 
@@ -109,25 +271,28 @@ class CorrelationTrainer(RegressionTrainer):
 
     @torch.no_grad()
     def predict_correlation(self, model: pl.LightningModule, dataloader) -> np.ndarray:
-        """
-        Returns context-specific correlation networks containing Pearson's correlation coefficient.
-
-        Returns
-        -------
-        correlations : (n, x_dim, x_dim)
-        """
-        # If the model already returns 'correlations' in predict_step, prefer that.
         preds = super().predict(model, dataloader)
-        if "correlations" in preds[0]:
-            cors = torch.cat([p["correlations"].detach().cpu() for p in preds], dim=0)
-            return cors.numpy()
+        preds_flat = _flatten_pl_predict_output(preds)
 
-        # Fallback: derive from betas like before
+        # If model returns correlations directly, gather and reorder them.
+        if preds_flat and ("correlations" in preds_flat[0]):
+            payload = _gather_predict_payload(preds, keys=("orig_idx", "correlations"))
+            if payload is None:
+                return None  # non-rank0 DDP
+            if "correlations" not in payload:
+                raise RuntimeError("predict_correlation: predict_step returned no 'correlations'.")
+            return payload["correlations"]
+
+        # Fallback: derive from betas
         betas, _ = self.predict_params(model, dataloader)
+        if betas is None:
+            return None  # non-rank0 DDP
+
         signs = np.sign(betas)
         signs[signs != np.transpose(signs, (0, 2, 1))] = 0
         correlations = signs * np.sqrt(np.abs(betas * np.transpose(betas, (0, 2, 1))))
         return correlations
+
 
 
 class MarkovTrainer(CorrelationTrainer):

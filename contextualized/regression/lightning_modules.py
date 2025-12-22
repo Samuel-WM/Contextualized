@@ -242,55 +242,119 @@ class ContextualizedRegressionBase(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
 
+    def _batch_size_from_batch(self, batch: dict) -> int:
+        # all your datasets provide "contexts" in the batch dict
+        if isinstance(batch, dict) and "contexts" in batch and isinstance(batch["contexts"], torch.Tensor):
+            return int(batch["contexts"].shape[0])
+        return 1
+
+
+    def _predict_payload(self, batch: dict, **outputs) -> dict:
+        """
+        Return a minimal, DDP-safe payload for trainer.predict:
+        - indices needed to reorder across ranks
+        - model outputs
+        Everything is detached and moved to CPU to avoid GPU memory blow-ups.
+        """
+        out = {}
+        for k in ("idx", "orig_idx", "sample_idx", "outcome_idx", "predictor_idx"):
+            if isinstance(batch, dict) and k in batch:
+                out[k] = batch[k]
+
+        out.update(outputs)
+
+        # Detach + move tensors to CPU for cheap gather/reorder in wrapper code later
+        for k, v in list(out.items()):
+            if isinstance(v, torch.Tensor):
+                out[k] = v.detach().cpu()
+        return out
+
+
     def training_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
         loss = self._batch_loss(batch, batch_idx)
-        self.log_dict({"train_loss": loss})
+        bs = self._batch_size_from_batch(batch)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=bs,
+        )
         return loss
+
 
     def validation_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
         loss = self._batch_loss(batch, batch_idx)
-        self.log_dict({"val_loss": loss})
+        bs = self._batch_size_from_batch(batch)
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=bs,
+        )
         return loss
+
 
     def test_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
         loss = self._batch_loss(batch, batch_idx)
-        self.log_dict({"test_loss": loss})
+        bs = self._batch_size_from_batch(batch)
+        self.log(
+            "test_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=bs,
+        )
         return loss
-
+    
     def _predict_from_models(self, X, beta_hat, mu_hat):
         """
         Make shapes consistent before computing:
             y = g( (beta ⊙ X).sum(-1, keepdim=True) + mu )
-
-        Expected canonical shapes:
-          - beta_hat: (B, y_dim, x_dim)
-          - mu_hat:   (B, y_dim, 1) or (B, y_dim)
-          - X: one of
-              * (B, x_dim)
-              * (B, 1, x_dim)
-              * (B, y_dim, x_dim)
-
-        We also accept beta_hat/mu_hat with an extra trailing singleton dim:
-          * (B, y_dim, x_dim, 1)  -> squeeze to (B, y_dim, x_dim)
+        ...
         """
+
+        # ---- Univariate grid case: X is (B, y_dim, x_dim, 1) ----
+        # singletask_univariate dataset convention produces predictors shaped (B, y, x, 1)
+        if isinstance(X, torch.Tensor) and X.dim() == 4 and X.shape[-1] == 1:
+            # move X to device/dtype
+            X = X.to(device=beta_hat.device, dtype=beta_hat.dtype)
+
+            # beta_hat should be (B, y, x, 1) in this regime
+            if beta_hat.dim() == 3:
+                beta_hat = beta_hat.unsqueeze(-1)
+            if beta_hat.dim() != 4 or beta_hat.shape[-1] != 1:
+                raise RuntimeError(f"Univariate expects beta_hat (B,y,x,1); got {beta_hat.shape}")
+
+            # mu_hat should broadcast to (B, y, x, 1)
+            if not isinstance(mu_hat, torch.Tensor):
+                mu_hat = torch.as_tensor(mu_hat, device=beta_hat.device, dtype=beta_hat.dtype)
+            else:
+                mu_hat = mu_hat.to(device=beta_hat.device, dtype=beta_hat.dtype)
+
+            if mu_hat.dim() == 2:
+                # (B, y) -> (B, y, 1, 1) -> expand across x
+                mu_hat = mu_hat.unsqueeze(-1).unsqueeze(-1).expand(-1, beta_hat.shape[1], beta_hat.shape[2], 1)
+            elif mu_hat.dim() == 3:
+                # (B, y, x) or (B, y, 1) -> (B, y, x, 1)
+                if mu_hat.shape[-1] == 1:
+                    mu_hat = mu_hat.unsqueeze(-1).expand(-1, beta_hat.shape[1], beta_hat.shape[2], 1)
+                else:
+                    mu_hat = mu_hat.unsqueeze(-1)
+            elif mu_hat.dim() == 4 and mu_hat.shape[-1] == 1:
+                pass
+            else:
+                raise RuntimeError(f"Unsupported mu_hat shape for univariate: {mu_hat.shape}")
+
+            out = (beta_hat * X).sum(dim=-1, keepdim=True) + mu_hat
+            return self.link_fn(out)
 
         # ---- Normalize beta_hat to (B, y_dim, x_dim) ----
         if not isinstance(beta_hat, torch.Tensor):
@@ -564,18 +628,10 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         return pred_loss + reg_loss
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
         beta_hat, mu_hat = self(batch)
-        batch.update({
-            "betas": beta_hat,
-            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-        })
-        return batch
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
 
     # def _params_reshape(self, preds, dataloader):
     #     """
@@ -741,11 +797,10 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
-        batch.update({
-            "betas": beta_hat,
-            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-        })
-        return batch
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
+
 
 
     # def _params_reshape(self, preds, dataloader):
@@ -882,11 +937,9 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
-        batch.update({
-            "betas": beta_hat,
-            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-        })
-        return batch
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
 
 
     # def _batch_loss(self, batch, batch_idx):
@@ -1041,18 +1094,10 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         return pred_loss + reg_loss
 
     def predict_step(self, batch, batch_idx):
-        """
-
-        :param batch:
-        :param batch_idx:
-
-        """
         beta_hat, mu_hat = self(batch)
-        batch.update({
-            "betas": beta_hat,  # keep last dim; downstream handles shape uniformly
-            "mus":   mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-        })
-        return batch
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
 
     # def _params_reshape(self, preds, dataloader):
     #     """
@@ -1176,11 +1221,9 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
-        batch.update({
-            "betas": beta_hat,  # keep last dim
-            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-        })
-        return batch
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
 
 
 class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
@@ -1273,11 +1316,9 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
-        batch.update({
-            "betas": beta_hat,  # keep last dim
-            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-        })
-        return batch
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
 
 
     # def _params_reshape(self, preds, dataloader):
@@ -1340,17 +1381,16 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
-        beta_hat = beta_hat.squeeze(-1)              # (B, y, x)
+        beta_hat = beta_hat.squeeze(-1)  # (B, y, x)
+
         beta_hat_T = beta_hat.transpose(1, 2)
         signs = torch.sign(beta_hat)
         signs[signs != signs.transpose(1, 2)] = 0
         correlations = signs * torch.sqrt(torch.abs(beta_hat * beta_hat_T))
-        batch.update({
-            "betas": beta_hat,
-            "mus":  mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1),
-            "correlations": correlations,
-        })
-        return batch
+
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat, correlations=correlations)
+
 
 
 
@@ -1410,14 +1450,12 @@ class ContextualizedNeighborhoodSelection(ContextualizedRegression):
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
-        beta_hat, mu_hat = self(batch)  # self.forward expects dict batch
-        # Zero diagonal (mask pre-registered in __init__)
+        beta_hat, mu_hat = self(batch)  # dict batch
         beta_hat = beta_hat * self.diag_mask.expand(beta_hat.shape[0], -1, -1)
-        batch.update({
-            "betas": beta_hat,
-            "mus": mu_hat,
-        })
-        return batch
+
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+
 
 
 
@@ -1440,11 +1478,9 @@ class ContextualizedMarkovGraph(ContextualizedRegression):
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)  # dict batch
-        # Enforce symmetry (hotfix) and zero diagonal
         beta_hat = beta_hat + beta_hat.transpose(1, 2)
         beta_hat = beta_hat * self.diag_mask.expand(beta_hat.shape[0], -1, -1)
-        batch.update({
-            "betas": beta_hat,
-            "mus": mu_hat,
-        })
-        return batch
+
+        mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
+        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
+

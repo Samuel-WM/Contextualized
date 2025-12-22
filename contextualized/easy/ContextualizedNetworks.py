@@ -1,11 +1,18 @@
 """
 sklearn-like interface to Contextualized Networks.
+
+CPU/DDP FIXES (drag-and-drop):
+1) When using a LightningDataModule outside Trainer.fit/predict, you MUST call
+   dm.setup(stage="predict") before dm.predict_dataloader().
+2) Under DDP, prediction helpers are rank-0 only (by design in your trainers/wrapper).
+   We therefore early-return None on non-rank0 to avoid constructing np.array([None,...]).
 """
 
 from typing import List, Tuple, Union, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from contextualized.easy.wrappers import SKLearnWrapper
 from contextualized.regression.trainers import CorrelationTrainer, MarkovTrainer
@@ -20,6 +27,16 @@ from contextualized.dags.lightning_modules import (
 )
 from contextualized.dags.trainers import GraphTrainer
 from contextualized.dags.graph_utils import dag_pred_np
+
+
+def _is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _rank() -> int:
+    if _is_distributed():
+        return dist.get_rank()
+    return 0
 
 
 class ContextualizedNetworks(SKLearnWrapper):
@@ -65,14 +82,25 @@ class ContextualizedNetworks(SKLearnWrapper):
         List[np.ndarray],
         Tuple[np.ndarray, np.ndarray],
         Tuple[List[np.ndarray], List[np.ndarray]],
+        None,
     ]:
         """
         Predicts context-specific network parameters (and offsets if available).
+
+        DDP behavior:
+        - rank0 returns arrays/tuples
+        - non-rank0 returns None
         """
-        betas, mus = self.predict_params(
-            C, individual_preds=individual_preds, uses_y=False, **kwargs
-        )
+        out = self.predict_params(C, individual_preds=individual_preds, uses_y=False, **kwargs)
+        if out is None:
+            return None
+
+        betas, mus = out
+        if betas is None:
+            return None
+
         return (betas, mus) if with_offsets else betas
+
 
     def predict_X(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
@@ -96,9 +124,18 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
 
     def predict_correlation(
         self, C: np.ndarray, individual_preds: bool = True, squared: bool = True
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
+        """
+        Returns per-sample correlation matrices (or squared correlations).
+
+        DDP behavior:
+        - All ranks must execute the predict loop to avoid collective mismatches.
+        - rank0 returns arrays
+        - non-rank0 returns None (propagated from trainer)
+        """
         C_scaled = self._maybe_scale_C(C)
         Y_zero = np.zeros((len(C_scaled), self.x_dim), dtype=np.float32)
+
         dm = self._build_datamodule(
             C=C_scaled,
             X=np.zeros((len(C_scaled), self.x_dim), dtype=np.float32),
@@ -110,60 +147,50 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
                 test_batch_size=self._init_kwargs["data"].get("test_batch_size", 16),
                 predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", 16),
                 num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
+                pin_memory=self._init_kwargs["data"].get(
+                    "pin_memory", (self.accelerator in ("cuda", "gpu"))
+                ),
                 persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
+                drop_last=False,
                 shuffle_train=False,
                 shuffle_eval=False,
                 dtype=self._init_kwargs["data"].get("dtype", torch.float),
             ),
-
             task_type="singletask_univariate",  # correlation uses univariate convention
         )
-        rhos = np.array([
-            self.trainers[i].predict_correlation(self.models[i], dm.predict_dataloader())
-            for i in range(len(self.models))
-        ])
+
+        # CRITICAL FIX: setup before calling predict_dataloader() when not using Trainer.predict(datamodule=...)
+        dm.setup(stage="predict")
+        pred_loader = dm.predict_dataloader()
+
+        rhos_list = []
+        for i in range(len(self.models)):
+            rho_i = self.trainers[i].predict_correlation(self.models[i], pred_loader)
+            if rho_i is None:
+                # non-rank0 under DDP
+                return None
+            rhos_list.append(rho_i)
+
+        rhos = np.array(rhos_list)
+
         if individual_preds:
             return np.square(rhos) if squared else rhos
+
         mean_rhos = np.mean(rhos, axis=0)
         return np.square(mean_rhos) if squared else mean_rhos
 
+
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
         """
-        Measures mean-squared reconstruction errors between the true X and the
-        reconstructed X_hat produced by the contextualized correlation network.
-
-        Parameters
-        ----------
-        C : np.ndarray
-            Context matrix of shape (N, C_dim).
-        X : np.ndarray
-            Data matrix of shape (N, F).
-        individual_preds : bool, default False
-            If False: return per-sample MSE averaged over bootstraps.
-            If True:  return per-bootstrap, per-sample MSE.
-
-        Returns
-        -------
-        np.ndarray
-            If individual_preds is False: shape (N_eff,), per-sample MSE averaged
-            over bootstraps.
-
-            If individual_preds is True: shape (B, N_eff), per-bootstrap, per-sample MSE.
-
-        Notes
-        -----
-        In single-process (non-distributed) settings, N_eff == N (full dataset).
-
-        Under distributed settings, predict_X may operate on rank-local shards so
-        the number of samples in X_hat (N_hat) may differ from len(X) (N_true).
-        In that case we align both X_hat and X to N_eff = min(N_hat, N_true) to
-        avoid shape mismatches, yielding valid MSEs for the evaluated subset.
+        Measures mean-squared reconstruction errors between true X and reconstructed X_hat.
+        (Behavior unchanged; this already handles N_hat != N_true.)
         """
-        # Predict reconstructions of X for each bootstrap model
         X_hat = self.predict_X(C, X, individual_preds=True)
+        if X_hat is None:
+            return None
+
         X_hat = np.array(X_hat)
 
         if X_hat.ndim not in (3, 4):
@@ -172,11 +199,9 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
                 "ContextualizedCorrelationNetworks.measure_mses"
             )
 
-        # X: (N_true, F)
         N_true, F = X.shape
 
         if X_hat.ndim == 3:
-            # X_hat: (B, N_hat, F_hat)
             B, N_hat, F_hat = X_hat.shape
             if F_hat != F:
                 raise ValueError(
@@ -184,21 +209,18 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
                     "in ContextualizedCorrelationNetworks.measure_mses"
                 )
 
-            # Align on the sample dimension
             N_eff = min(N_hat, N_true)
             if N_hat != N_true:
                 X_hat = X_hat[:, :N_eff, :]
                 X_eff = X[:N_eff, :]
             else:
-                N_eff = N_true
                 X_eff = X
 
-            X_true = X_eff[None, :, :]          # (1, N_eff, F)
-            residuals = X_hat - X_true          # (B, N_eff, F)
-            mses = (residuals ** 2).mean(axis=-1)  # (B, N_eff)
+            X_true = X_eff[None, :, :]
+            residuals = X_hat - X_true
+            mses = (residuals ** 2).mean(axis=-1)
 
-        else:  # X_hat.ndim == 4
-            # X_hat: (B, N_hat, F1, F2)
+        else:
             B, N_hat, F1, F2 = X_hat.shape
             if F1 != F:
                 raise ValueError(
@@ -211,20 +233,13 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
                 X_hat = X_hat[:, :N_eff, :, :]
                 X_eff = X[:N_eff, :]
             else:
-                N_eff = N_true
                 X_eff = X
 
-            X_true = X_eff[None, :, :, None]    # (1, N_eff, F, 1)
-            residuals = X_hat - X_true          # (B, N_eff, F, F2)
-            mses = (residuals ** 2).mean(axis=(-1, -2))  # (B, N_eff)
+            X_true = X_eff[None, :, :, None]
+            residuals = X_hat - X_true
+            mses = (residuals ** 2).mean(axis=(-1, -2))
 
-        # mses: (B, N_eff)
         return mses if individual_preds else mses.mean(axis=0)
-
-
-
-
-
 
 
 class ContextualizedMarkovNetworks(ContextualizedNetworks):
@@ -237,12 +252,18 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
 
     def predict_precisions(
         self, C: np.ndarray, individual_preds: bool = True
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
         """
         Predicts context-specific precision matrices.
+
+        DDP behavior:
+        - All ranks must execute the predict loop to avoid collective mismatches.
+        - rank0 returns arrays
+        - non-rank0 returns None (propagated from trainer)
         """
         C_scaled = self._maybe_scale_C(C)
         Y_zero = np.zeros((len(C_scaled), self.x_dim), dtype=np.float32)
+
         dm = self._build_datamodule(
             C=C_scaled,
             X=np.zeros((len(C_scaled), self.x_dim), dtype=np.float32),
@@ -254,29 +275,46 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
                 test_batch_size=self._init_kwargs["data"].get("test_batch_size", 16),
                 predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", 16),
                 num_workers=self._init_kwargs["data"].get("num_workers", 0),
-                pin_memory=self._init_kwargs["data"].get("pin_memory", (self.accelerator in ("cuda", "gpu"))),
+                pin_memory=self._init_kwargs["data"].get(
+                    "pin_memory", (self.accelerator in ("cuda", "gpu"))
+                ),
                 persistent_workers=self._init_kwargs["data"].get("persistent_workers", False),
+                drop_last=False,
                 shuffle_train=False,
                 shuffle_eval=False,
                 dtype=self._init_kwargs["data"].get("dtype", torch.float),
             ),
-
             task_type="singletask_univariate",
         )
-        precisions = np.array([
-            self.trainers[i].predict_precision(self.models[i], dm.predict_dataloader())
-            for i in range(len(self.models))
-        ])
+
+        # CRITICAL FIX: setup before calling predict_dataloader()
+        dm.setup(stage="predict")
+        pred_loader = dm.predict_dataloader()
+
+        prec_list = []
+        for i in range(len(self.models)):
+            p_i = self.trainers[i].predict_precision(self.models[i], pred_loader)
+            if p_i is None:
+                # non-rank0 under DDP
+                return None
+            prec_list.append(p_i)
+
+        precisions = np.array(prec_list)
         return precisions if individual_preds else np.mean(precisions, axis=0)
+
 
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
         """
         Measures mean-squared reconstruction errors using precision-implied betas/mus.
         """
-        betas, mus = self.predict_networks(C, individual_preds=True, with_offsets=True)
-        mses = np.zeros((len(betas), len(C)))  # n_bootstraps x n_samples
+        out = self.predict_networks(C, individual_preds=True, with_offsets=True)
+        if out is None:
+            return None
+        betas, mus = out
+
+        mses = np.zeros((len(betas), len(C)))
         F = X.shape[-1]
         for b in range(len(betas)):
             for i in range(F):
@@ -300,7 +338,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         """
         Parse NOTMAD kwargs into model init dicts.
         """
-        # Encoder Parameters
         self._init_kwargs["model"]["encoder_kwargs"] = {
             "type": kwargs.pop(
                 "encoder_type", self._init_kwargs["model"]["encoder_type"]
@@ -312,7 +349,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
             },
         }
 
-        # Archetype parameters
         archetype_dag_loss_type = kwargs.pop(
             "archetype_dag_loss_type", DEFAULT_DAG_LOSS_TYPE
         )
@@ -339,7 +375,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
             )
             self._init_kwargs["model"]["archetype_loss_params"]["num_archetypes"] = 16
 
-        # Allow convenience overrides for archetype DAG params
         for param, value in self._init_kwargs["model"]["archetype_loss_params"]["dag"][
             "params"
         ].items():
@@ -347,7 +382,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
                 param
             ] = kwargs.pop(f"archetype_{param}", value)
 
-        # Sample-specific parameters
         sample_specific_dag_loss_type = kwargs.pop(
             "sample_specific_dag_loss_type", DEFAULT_DAG_LOSS_TYPE
         )
@@ -371,7 +405,6 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
                 param
             ] = kwargs.pop(f"sample_specific_{param}", value)
 
-        # Optimization parameters
         self._init_kwargs["model"]["opt_params"] = {
             "learning_rate": kwargs.pop("learning_rate", 1e-3),
             "step": kwargs.pop("step", 50),
@@ -422,16 +455,15 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
 
     def predict_params(
         self, C: np.ndarray, **kwargs
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
         """
         Predicts context-specific Bayesian network parameters (SEM coefficients).
         """
-        # No mus for NOTMAD at present.
         return super().predict_params(C, model_includes_mus=False, **kwargs)
 
     def predict_networks(
         self, C: np.ndarray, project_to_dag: bool = True, **kwargs
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
         """
         Predicts context-specific Bayesian networks (optionally projected to DAG).
         """
@@ -444,12 +476,15 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
 
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+    ) -> Union[np.ndarray, List[np.ndarray], None]:
         """
         Measures mean-squared errors of DAG-based reconstruction.
         """
         betas = self.predict_networks(C, individual_preds=True, **kwargs)
-        mses = np.zeros((len(betas), len(C)))  # n_bootstraps x n_samples
+        if betas is None:
+            return None
+
+        mses = np.zeros((len(betas), len(C)))
         for b in range(len(betas)):
             X_pred = dag_pred_np(X, betas[b])
             mses[b, :] = np.mean((X - X_pred) ** 2, axis=1)

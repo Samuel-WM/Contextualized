@@ -46,24 +46,139 @@ def _is_main_process() -> bool:
     """Check if this is the main process (rank 0)."""
     return _get_rank() == 0
 
+def _flatten_pl_predict_output(preds):
+    """
+    Lightning can return:
+      - list[dict]  (single dataloader)
+      - list[list[dict]] (multiple dataloaders)
+    Normalize to list[dict].
+    """
+    if preds is None:
+        return []
+    if len(preds) > 0 and isinstance(preds[0], list):
+        out = []
+        for sub in preds:
+            out.extend(sub)
+        return out
+    return preds
 
-def _gather_predictions(local_preds: np.ndarray, world_size: int) -> np.ndarray:
+
+def _pack_local_pred_payload(pred_list: list) -> dict:
     """
-    Gather predictions from all ranks to rank 0.
-    Returns full predictions on rank 0, None on other ranks.
+    Convert list[dict] -> dict[str, np.ndarray] by concatenating along axis 0.
+    Assumes each dict entry is either a torch.Tensor (CPU) or a Python scalar.
     """
-    if not _is_distributed() or world_size == 1:
-        return local_preds
-    
-    local_tensor = torch.from_numpy(local_preds).cuda()
-    
+    pred_list = _flatten_pl_predict_output(pred_list)
+    if not pred_list:
+        return {}
+
+    # Union of keys across batches (some models include extra keys)
+    keys = set()
+    for d in pred_list:
+        keys.update(d.keys())
+
+    packed = {}
+    for k in keys:
+        chunks = []
+        for d in pred_list:
+            if k not in d:
+                continue
+            v = d[k]
+            if torch.is_tensor(v):
+                chunks.append(v.detach().cpu().numpy())
+            else:
+                chunks.append(np.asarray(v))
+        if not chunks:
+            continue
+        # Concatenate on first dim where possible; fallback to stack
+        try:
+            packed[k] = np.concatenate(chunks, axis=0)
+        except Exception:
+            packed[k] = np.stack(chunks, axis=0)
+    return packed
+
+
+def _gather_object_to_rank0(obj):
+    """
+    Gather arbitrary Python objects to rank 0.
+    Returns: list[obj] on rank 0, None on non-zero ranks.
+    """
+    if not _is_distributed():
+        return [obj]
+
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return [obj]
+
     if _is_main_process():
-        gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
-        dist.gather(local_tensor, gather_list=gathered, dst=0)
-        return torch.cat(gathered, dim=0).cpu().numpy()
+        gathered = [None for _ in range(world_size)]
+        dist.gather_object(obj, object_gather_list=gathered, dst=0)
+        return gathered
     else:
-        dist.gather(local_tensor, dst=0)
+        dist.gather_object(obj, object_gather_list=None, dst=0)
         return None
+
+
+def _merge_packed_payloads(payloads: list) -> dict:
+    """
+    Merge list[dict[str, np.ndarray]] -> dict[str, np.ndarray] by concatenation axis 0.
+    """
+    merged = {}
+    if not payloads:
+        return merged
+
+    keys = set()
+    for p in payloads:
+        if p:
+            keys.update(p.keys())
+
+    for k in keys:
+        chunks = [p[k] for p in payloads if p and (k in p) and (p[k] is not None) and (len(p[k]) > 0)]
+        if not chunks:
+            continue
+        merged[k] = np.concatenate(chunks, axis=0)
+    return merged
+
+
+def _stable_sort_and_dedupe_by_key(payload: dict, primary: str, secondary: tuple = ()) -> dict:
+    """
+    Sort payload arrays by a composite key (primary + optional secondary indices),
+    then dedupe (needed because DistributedSampler may pad/duplicate).
+    """
+    if (payload is None) or (primary not in payload) or (len(payload[primary]) == 0):
+        return payload
+
+    primary_arr = payload[primary].astype(np.int64)
+
+    # Build composite key
+    if secondary:
+        parts = [primary_arr]
+        for s in secondary:
+            if s in payload:
+                parts.append(payload[s].astype(np.int64))
+        if len(parts) == 1:
+            key = primary_arr
+        else:
+            # lexsort uses last key as primary; reverse order
+            order = np.lexsort(tuple(reversed(parts)))
+            key_sorted = np.stack([p[order] for p in parts], axis=1)
+            # Dedup by full composite row
+            _, uniq_pos = np.unique(key_sorted, axis=0, return_index=True)
+            keep = order[np.sort(uniq_pos)]
+    else:
+        order = np.argsort(primary_arr, kind="mergesort")
+        key_sorted = primary_arr[order]
+        _, uniq_pos = np.unique(key_sorted, return_index=True)
+        keep = order[np.sort(uniq_pos)]
+
+    out = {}
+    for k, v in payload.items():
+        if isinstance(v, np.ndarray) and (v.shape[0] == primary_arr.shape[0]):
+            out[k] = v[keep]
+        else:
+            out[k] = v
+    return out
+
 
 
 class SKLearnWrapper:
@@ -627,9 +742,6 @@ class SKLearnWrapper:
         return torch.device("cpu")
 
     def predict(self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs):
-        """
-        FIXED: Proper single-device inference that works after DDP training.
-        """
         if not hasattr(self, "models") or self.models is None:
             raise ValueError("Trying to predict with a model that hasn't been trained yet.")
 
@@ -637,10 +749,6 @@ class SKLearnWrapper:
         Xq = self._maybe_scale_X(X)
         Yq = np.zeros((len(Cq), self.y_dim), dtype=np.float32)
 
-        # FIXED: Use single device for inference
-        device = self._get_inference_device()
-
-        # Build dataloader without distributed sampler
         dm = self._build_datamodule(
             C=Cq,
             X=Xq,
@@ -651,7 +759,7 @@ class SKLearnWrapper:
                 val_batch_size=self._init_kwargs["data"].get("val_batch_size", self.default_val_batch_size),
                 test_batch_size=self._init_kwargs["data"].get("test_batch_size", self.default_test_batch_size),
                 predict_batch_size=self._init_kwargs["data"].get("predict_batch_size", self.default_val_batch_size),
-                num_workers=0,  # Single-threaded for inference simplicity
+                num_workers=0,
                 pin_memory=False,
                 persistent_workers=False,
                 shuffle_train=False,
@@ -661,53 +769,101 @@ class SKLearnWrapper:
             task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
                     else "singletask_multivariate",
         )
-        
-        # Setup the datamodule
-        dm.setup(stage="predict")
-        pred_loader = dm.predict_dataloader()
 
+        # Let Lightning handle sharding under DDP
         preds = []
+        n_expected = len(Cq)
+
         for i in range(len(self.models)):
             model = self.models[i]
             model.eval()
-            model.to(device)
 
-            out_batches = []
-            with torch.no_grad():
-                for b_idx, batch in enumerate(pred_loader):
-                    # Move batch to device
-                    batch = {
-                        k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-                        for k, v in batch.items()
-                    }
-                    
-                    out = model.predict_step(batch, b_idx)
+            # Prefer the trainer created during fit (keeps strategy/devices consistent)
+            trainer = None
+            if hasattr(self, "trainers") and self.trainers is not None and i < len(self.trainers):
+                trainer = self.trainers[i]
 
-                    Cb = out.get("contexts")
-                    Xb = out.get("predictors")
-                    betas = out["betas"]
-                    mus = out["mus"]
+            if _is_distributed() and trainer is not None:
+                # ---- DDP path: use trainer.predict + gather outputs to rank 0 ----
+                local_pred = trainer.predict(model, datamodule=dm)
 
-                    yb = model._predict_y(Cb, Xb, betas, mus)
-                    out_batches.append(yb.detach().cpu())
+                local_packed = _pack_local_pred_payload(local_pred)
+                gathered = _gather_object_to_rank0(local_packed)
 
-            yhat = torch.cat(out_batches, dim=0).numpy()
-            preds.append(yhat)
+                if not _is_main_process():
+                    # Non-zero ranks return nothing; rank 0 will return the final answer.
+                    return None
+
+                merged = _merge_packed_payloads(gathered)
+
+                # Sort/dedupe by orig_idx (DistributedSampler may pad)
+                merged = _stable_sort_and_dedupe_by_key(merged, primary="orig_idx")
+
+                if "betas" not in merged or "mus" not in merged or "orig_idx" not in merged:
+                    raise RuntimeError("predict: Missing required keys in gathered payload: need orig_idx, betas, mus.")
+
+                orig_idx = merged["orig_idx"].astype(np.int64)
+                betas = torch.as_tensor(merged["betas"])
+                mus = torch.as_tensor(merged["mus"])
+
+                # Ensure we are aligned to query order
+                # (orig_idx is row-id into the query arrays because predict_idx=np.arange(n))
+                C_sorted = torch.as_tensor(Cq[orig_idx], dtype=betas.dtype)
+                X_sorted = torch.as_tensor(Xq[orig_idx], dtype=betas.dtype)
+
+                # Compute yhat on rank 0 in correct global order
+                with torch.no_grad():
+                    yhat = model._predict_y(C_sorted, X_sorted, betas, mus).detach().cpu().numpy()
+
+                # If DDP padded, we may have > n_expected; trim safely by orig_idx range
+                # (should not happen if orig_idx is in [0, n_expected))
+                if yhat.shape[0] != n_expected:
+                    # Build dense output in original query order
+                    dense = np.zeros((n_expected,) + yhat.shape[1:], dtype=yhat.dtype)
+                    dense[orig_idx] = yhat
+                    yhat = dense
+
+                preds.append(yhat)
+
+            else:
+                # ---- Single-process fallback: iterate predict_dataloader directly ----
+                dm.setup(stage="predict")
+                pred_loader = dm.predict_dataloader()
+
+                out_batches = []
+                device = self._get_inference_device()
+                model.to(device)
+
+                with torch.no_grad():
+                    for b_idx, batch in enumerate(pred_loader):
+                        batch = {
+                            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                            for k, v in batch.items()
+                        }
+
+                        out = model.predict_step(batch, b_idx)
+                        betas = out["betas"]
+                        mus = out["mus"]
+
+                        # IMPORTANT: use the *batch* for C/X, not the output payload
+                        yb = model._predict_y(batch["contexts"], batch["predictors"], betas, mus)
+                        out_batches.append(yb.detach().cpu())
+
+                yhat = torch.cat(out_batches, dim=0).numpy()
+                preds.append(yhat)
 
         predictions = np.array(preds)
-
         if not individual_preds:
             predictions = np.mean(predictions, axis=0)
 
         if self.normalize and self.scalers["Y"] is not None:
             if individual_preds:
-                predictions = np.array(
-                    [self.scalers["Y"].inverse_transform(p) for p in predictions]
-                )
+                predictions = np.array([self.scalers["Y"].inverse_transform(p) for p in predictions])
             else:
                 predictions = self.scalers["Y"].inverse_transform(predictions)
 
         return predictions
+
 
     def predict_params(
         self,
@@ -716,9 +872,6 @@ class SKLearnWrapper:
         model_includes_mus: bool = True,
         **kwargs,
     ):
-        """
-        FIXED: Proper single-device inference for parameter prediction.
-        """
         if not hasattr(self, "models") or self.models is None:
             raise ValueError("Trying to predict with a model that hasn't been trained yet.")
 
@@ -727,7 +880,6 @@ class SKLearnWrapper:
         Y_zero = np.zeros((len(Cq), self.y_dim), dtype=np.float32)
 
         uses_y = kwargs.pop("uses_y", True)
-        device = self._get_inference_device()
 
         dm = self._build_datamodule(
             C=Cq,
@@ -749,51 +901,87 @@ class SKLearnWrapper:
             task_type="singletask_univariate" if self._init_kwargs["model"].get("univariate", False)
                     else "singletask_multivariate",
         )
-        
-        dm.setup(stage="predict")
-        pred_loader = dm.predict_dataloader()
 
         out_betas, out_mus = [], []
+        n_expected = len(Cq)
 
         for i in range(len(self.models)):
             model = self.models[i]
             model.eval()
-            model.to(device)
 
-            beta_batches, mu_batches = [], []
+            trainer = None
+            if hasattr(self, "trainers") and self.trainers is not None and i < len(self.trainers):
+                trainer = self.trainers[i]
 
-            with torch.no_grad():
-                for b_idx, batch in enumerate(pred_loader):
-                    batch = {
-                        k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-                        for k, v in batch.items()
-                    }
-                    out = model.predict_step(batch, b_idx)
+            if _is_distributed() and trainer is not None:
+                local_pred = trainer.predict(model, datamodule=dm)
+                local_packed = _pack_local_pred_payload(local_pred)
+                gathered = _gather_object_to_rank0(local_packed)
 
-                    betas_b = out["betas"].detach().cpu()
-                    beta_batches.append(betas_b)
+                if not _is_main_process():
+                    return (None, None) if model_includes_mus else None
 
-                    if model_includes_mus:
-                        mus_b = out["mus"].detach().cpu()
-                        mu_batches.append(mus_b)
 
-            betas_i = torch.cat(beta_batches, dim=0).numpy()
-            if model_includes_mus:
-                mus_i = torch.cat(mu_batches, dim=0).numpy()
+                merged = _merge_packed_payloads(gathered)
+                merged = _stable_sort_and_dedupe_by_key(merged, primary="orig_idx")
+
+                if "betas" not in merged or "orig_idx" not in merged:
+                    raise RuntimeError("predict_params: Missing required keys in gathered payload: need orig_idx, betas.")
+
+                orig_idx = merged["orig_idx"].astype(np.int64)
+
+                betas_i = merged["betas"]
+                if betas_i.shape[0] != n_expected:
+                    dense_b = np.zeros((n_expected,) + betas_i.shape[1:], dtype=betas_i.dtype)
+                    dense_b[orig_idx] = betas_i
+                    betas_i = dense_b
+
                 out_betas.append(betas_i)
-                out_mus.append(mus_i)
+
+                if model_includes_mus:
+                    if "mus" not in merged:
+                        raise RuntimeError("predict_params: model_includes_mus=True but mus missing in payload.")
+                    mus_i = merged["mus"]
+                    if mus_i.shape[0] != n_expected:
+                        dense_m = np.zeros((n_expected,) + mus_i.shape[1:], dtype=mus_i.dtype)
+                        dense_m[orig_idx] = mus_i
+                        mus_i = dense_m
+                    out_mus.append(mus_i)
+
             else:
+                # Single-process fallback (local ordered)
+                dm.setup(stage="predict")
+                pred_loader = dm.predict_dataloader()
+
+                device = self._get_inference_device()
+                model.to(device)
+
+                beta_batches, mu_batches = [], []
+                with torch.no_grad():
+                    for b_idx, batch in enumerate(pred_loader):
+                        batch = {
+                            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                            for k, v in batch.items()
+                        }
+                        out = model.predict_step(batch, b_idx)
+                        beta_batches.append(out["betas"].detach().cpu())
+                        if model_includes_mus:
+                            mu_batches.append(out["mus"].detach().cpu())
+
+                betas_i = torch.cat(beta_batches, dim=0).numpy()
                 out_betas.append(betas_i)
 
+                if model_includes_mus:
+                    mus_i = torch.cat(mu_batches, dim=0).numpy()
+                    out_mus.append(mus_i)
+
+        betas = np.array(out_betas)
         if model_includes_mus:
-            betas = np.array(out_betas)
             mus = np.array(out_mus)
-            if individual_preds:
-                return betas, mus
-            return np.mean(betas, axis=0), np.mean(mus, axis=0)
-        else:
-            betas = np.array(out_betas)
-            return betas if individual_preds else np.mean(betas, axis=0)
+            return (betas, mus) if individual_preds else (np.mean(betas, axis=0), np.mean(mus, axis=0))
+
+        return betas if individual_preds else np.mean(betas, axis=0)
+
 
     def fit(self, *args, **kwargs) -> None:
         """

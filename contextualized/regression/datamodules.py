@@ -47,6 +47,18 @@ def _maybe_index(x: torch.Tensor, idx: IndexLike) -> torch.Tensor:
     # assume Sequence[int]
     return x[torch.as_tensor(idx, dtype=torch.long)]
 
+def _to_index_tensor(idx: IndexLike) -> Optional[torch.Tensor]:
+    """Normalize an index-like into a 1D CPU LongTensor."""
+    if idx is None:
+        return None
+    if isinstance(idx, torch.Tensor):
+        out = idx.to(dtype=torch.long, device="cpu")
+    elif isinstance(idx, np.ndarray):
+        out = torch.as_tensor(idx, dtype=torch.long, device="cpu")
+    else:
+        # assume Sequence[int]
+        out = torch.as_tensor(idx, dtype=torch.long, device="cpu")
+    return out.view(-1)  # ensure 1D
 
 class ContextualizedRegressionDataModule(pl.LightningDataModule):
     """
@@ -164,18 +176,22 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         def _mk_dataset(idx: IndexLike):
             if idx is None:
                 return None
-            C_s = _maybe_index(C, idx)
-            X_s = _maybe_index(X, idx)
-            Y_s = None if (Y is None) else _maybe_index(Y, idx)
+
+            idx_t = _to_index_tensor(idx)  # <-- NEW: stable mapping to original rows
+
+            C_s = _maybe_index(C, idx_t)
+            X_s = _maybe_index(X, idx_t)
+            Y_s = None if (Y is None) else _maybe_index(Y, idx_t)
             ds_cls = TASK_TO_DATASET[self.task_type]
 
             if Y_s is None:
                 # Allow unsupervised / network-style usage where Y is omitted.
                 # In that case, use X as a dummy target so shapes line up.
-                # This mirrors the old CorrelationDataModule behavior (Y = X).
                 Y_s = X_s
 
-            return ds_cls(C_s, X_s, Y_s, dtype=self.dtype)
+            # IMPORTANT: pass orig_idx so every item can report its original row id
+            return ds_cls(C_s, X_s, Y_s, orig_idx=idx_t, dtype=self.dtype)
+
 
 
 
@@ -188,14 +204,15 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         self.C, self.X, self.Y = C, X, Y
 
     # ---- Dataloaders ----
-    def _common_dl_kwargs(self, batch_size: int) -> Dict:
+    def _common_dl_kwargs(self, batch_size: int, *, drop_last: Optional[bool] = None) -> Dict:
         return {
             "batch_size": batch_size,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
             "persistent_workers": bool(self.num_workers > 0 and self.persistent_workers),
-            "drop_last": self.drop_last,
+            "drop_last": self.drop_last if drop_last is None else bool(drop_last),
         }
+
 
 
 
@@ -205,7 +222,7 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset=self.ds_train,
             shuffle=self.shuffle_train,
-            **self._common_dl_kwargs(self.train_batch_size),
+            **self._common_dl_kwargs(self.train_batch_size, drop_last=self.drop_last),
         )
 
     def val_dataloader(self):
@@ -214,7 +231,8 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset=self.ds_val,
             shuffle=self.shuffle_eval,
-            **self._common_dl_kwargs(self.val_batch_size),
+            # NEVER drop samples for eval (avoids silent data loss / mis-ordering)
+            **self._common_dl_kwargs(self.val_batch_size, drop_last=False),
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -223,7 +241,7 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset=self.ds_test,
             shuffle=self.shuffle_eval,
-            **self._common_dl_kwargs(self.test_batch_size),
+            **self._common_dl_kwargs(self.test_batch_size, drop_last=False),
         )
 
     def predict_dataloader(self) -> DataLoader:
@@ -232,5 +250,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset=self.ds_predict,
             shuffle=False,
-            **self._common_dl_kwargs(self.predict_batch_size),
+            **self._common_dl_kwargs(self.predict_batch_size, drop_last=False),
         )
+
