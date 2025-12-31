@@ -5,7 +5,9 @@ CPU/DDP FIXES (drag-and-drop):
 1) When using a LightningDataModule outside Trainer.fit/predict, you MUST call
    dm.setup(stage="predict") before dm.predict_dataloader().
 2) Under DDP, prediction helpers are rank-0 only (by design in your trainers/wrapper).
-   We therefore early-return None on non-rank0 to avoid constructing np.array([None,...]).
+   We therefore avoid constructing np.array([None,...]) and return None on non-rank0,
+   while still executing the full per-model predict loop on all ranks to prevent
+   collective mismatches/hangs.
 """
 
 from typing import List, Tuple, Union, Optional
@@ -101,7 +103,6 @@ class ContextualizedNetworks(SKLearnWrapper):
 
         return (betas, mus) if with_offsets else betas
 
-
     def predict_X(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False, **kwargs
     ) -> Union[np.ndarray, List[np.ndarray]]:
@@ -118,9 +119,7 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
     """
 
     def __init__(self, **kwargs):
-        super().__init__(
-            ContextualizedCorrelation, [], [], CorrelationTrainer, **kwargs
-        )
+        super().__init__(ContextualizedCorrelation, [], [], CorrelationTrainer, **kwargs)
 
     def predict_correlation(
         self, C: np.ndarray, individual_preds: bool = True, squared: bool = True
@@ -129,9 +128,9 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
         Returns per-sample correlation matrices (or squared correlations).
 
         DDP behavior:
-        - All ranks must execute the predict loop to avoid collective mismatches.
+        - All ranks must execute the full per-model predict loop to avoid collective mismatches.
         - rank0 returns arrays
-        - non-rank0 returns None (propagated from trainer)
+        - non-rank0 returns None (rank-0-only trainer outputs are propagated)
         """
         C_scaled = self._maybe_scale_C(C)
         Y_zero = np.zeros((len(C_scaled), self.x_dim), dtype=np.float32)
@@ -159,17 +158,23 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
             task_type="singletask_univariate",  # correlation uses univariate convention
         )
 
-        # CRITICAL FIX: setup before calling predict_dataloader() when not using Trainer.predict(datamodule=...)
+        # FIX (1): setup before calling predict_dataloader() when not using Trainer.predict(datamodule=...)
         dm.setup(stage="predict")
         pred_loader = dm.predict_dataloader()
 
+        saw_none = False
         rhos_list = []
+
+        # FIX (2): call predict for all models on all ranks; only rank0 accumulates results
         for i in range(len(self.models)):
             rho_i = self.trainers[i].predict_correlation(self.models[i], pred_loader)
             if rho_i is None:
-                # non-rank0 under DDP
-                return None
+                saw_none = True
+                continue
             rhos_list.append(rho_i)
+
+        if saw_none:
+            return None
 
         rhos = np.array(rhos_list)
 
@@ -178,7 +183,6 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
 
         mean_rhos = np.mean(rhos, axis=0)
         return np.square(mean_rhos) if squared else mean_rhos
-
 
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False
@@ -218,7 +222,7 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
 
             X_true = X_eff[None, :, :]
             residuals = X_hat - X_true
-            mses = (residuals ** 2).mean(axis=-1)
+            mses = (residuals**2).mean(axis=-1)
 
         else:
             B, N_hat, F1, F2 = X_hat.shape
@@ -237,7 +241,7 @@ class ContextualizedCorrelationNetworks(ContextualizedNetworks):
 
             X_true = X_eff[None, :, :, None]
             residuals = X_hat - X_true
-            mses = (residuals ** 2).mean(axis=(-1, -2))
+            mses = (residuals**2).mean(axis=(-1, -2))
 
         return mses if individual_preds else mses.mean(axis=0)
 
@@ -257,9 +261,9 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
         Predicts context-specific precision matrices.
 
         DDP behavior:
-        - All ranks must execute the predict loop to avoid collective mismatches.
+        - All ranks must execute the full per-model predict loop to avoid collective mismatches.
         - rank0 returns arrays
-        - non-rank0 returns None (propagated from trainer)
+        - non-rank0 returns None (rank-0-only trainer outputs are propagated)
         """
         C_scaled = self._maybe_scale_C(C)
         Y_zero = np.zeros((len(C_scaled), self.x_dim), dtype=np.float32)
@@ -287,21 +291,26 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
             task_type="singletask_univariate",
         )
 
-        # CRITICAL FIX: setup before calling predict_dataloader()
+        # FIX (1): setup before calling predict_dataloader()
         dm.setup(stage="predict")
         pred_loader = dm.predict_dataloader()
 
+        saw_none = False
         prec_list = []
+
+        # FIX (2): call predict for all models on all ranks; only rank0 accumulates results
         for i in range(len(self.models)):
             p_i = self.trainers[i].predict_precision(self.models[i], pred_loader)
             if p_i is None:
-                # non-rank0 under DDP
-                return None
+                saw_none = True
+                continue
             prec_list.append(p_i)
+
+        if saw_none:
+            return None
 
         precisions = np.array(prec_list)
         return precisions if individual_preds else np.mean(precisions, axis=0)
-
 
     def measure_mses(
         self, C: np.ndarray, X: np.ndarray, individual_preds: bool = False
@@ -319,10 +328,7 @@ class ContextualizedMarkovNetworks(ContextualizedNetworks):
         for b in range(len(betas)):
             for i in range(F):
                 preds = np.array(
-                    [
-                        X[j].dot(betas[b, j, i, :]) + mus[b, j, i]
-                        for j in range(len(X))
-                    ]
+                    [X[j].dot(betas[b, j, i, :]) + mus[b, j, i] for j in range(len(X))]
                 )
                 residuals = X[:, i] - preds
                 mses[b, :] += residuals**2 / F
@@ -339,9 +345,7 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         Parse NOTMAD kwargs into model init dicts.
         """
         self._init_kwargs["model"]["encoder_kwargs"] = {
-            "type": kwargs.pop(
-                "encoder_type", self._init_kwargs["model"]["encoder_type"]
-            ),
+            "type": kwargs.pop("encoder_type", self._init_kwargs["model"]["encoder_type"]),
             "params": {
                 "width": self.constructor_kwargs["encoder_kwargs"]["width"],
                 "layers": self.constructor_kwargs["encoder_kwargs"]["layers"],
@@ -349,9 +353,7 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
             },
         }
 
-        archetype_dag_loss_type = kwargs.pop(
-            "archetype_dag_loss_type", DEFAULT_DAG_LOSS_TYPE
-        )
+        archetype_dag_loss_type = kwargs.pop("archetype_dag_loss_type", DEFAULT_DAG_LOSS_TYPE)
         self._init_kwargs["model"]["archetype_loss_params"] = {
             "l1": kwargs.get("archetype_l1", 0.0),
             "dag": kwargs.get(
@@ -378,9 +380,9 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         for param, value in self._init_kwargs["model"]["archetype_loss_params"]["dag"][
             "params"
         ].items():
-            self._init_kwargs["model"]["archetype_loss_params"]["dag"]["params"][
-                param
-            ] = kwargs.pop(f"archetype_{param}", value)
+            self._init_kwargs["model"]["archetype_loss_params"]["dag"]["params"][param] = (
+                kwargs.pop(f"archetype_{param}", value)
+            )
 
         sample_specific_dag_loss_type = kwargs.pop(
             "sample_specific_dag_loss_type", DEFAULT_DAG_LOSS_TYPE
@@ -398,12 +400,12 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
                 },
             ),
         }
-        for param, value in self._init_kwargs["model"]["sample_specific_loss_params"][
-            "dag"
-        ]["params"].items():
-            self._init_kwargs["model"]["sample_specific_loss_params"]["dag"]["params"][
-                param
-            ] = kwargs.pop(f"sample_specific_{param}", value)
+        for param, value in self._init_kwargs["model"]["sample_specific_loss_params"]["dag"][
+            "params"
+        ].items():
+            self._init_kwargs["model"]["sample_specific_loss_params"]["dag"]["params"][param] = (
+                kwargs.pop(f"sample_specific_{param}", value)
+            )
 
         self._init_kwargs["model"]["opt_params"] = {
             "learning_rate": kwargs.pop("learning_rate", 1e-3),
@@ -469,9 +471,7 @@ class ContextualizedBayesianNetworks(ContextualizedNetworks):
         """
         if kwargs.pop("with_offsets", False):
             print("No offsets can be returned by NOTMAD.")
-        betas = self.predict_params(
-            C, uses_y=False, project_to_dag=project_to_dag, **kwargs
-        )
+        betas = self.predict_params(C, uses_y=False, project_to_dag=project_to_dag, **kwargs)
         return betas
 
     def measure_mses(

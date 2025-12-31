@@ -273,16 +273,31 @@ class ContextualizedRegressionBase(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self._batch_loss(batch, batch_idx)
         bs = self._batch_size_from_batch(batch)
+
+        # Step-level logging: keep visibility, avoid per-step all-reduce (DDP scaling killer)
+        self.log(
+            "train_loss_step",
+            loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=False,
+            batch_size=bs,
+        )
+
+        # Epoch-level logging: sync across ranks once per epoch (correct global metric)
         self.log(
             "train_loss",
             loss,
-            on_step=True,
+            on_step=False,
             on_epoch=True,
-            prog_bar=True,
+            prog_bar=False,
             sync_dist=True,
             batch_size=bs,
         )
+
         return loss
+
 
 
     def validation_step(self, batch, batch_idx):
