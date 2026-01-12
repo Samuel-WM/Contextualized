@@ -1,135 +1,48 @@
 #!/usr/bin/env python3
-"""
-scale_bench.py
-
-A single-node, torchrun-friendly DDP scaling benchmark for ContextualizedRegression.
-
-Design goals (to reveal true scaling):
-  - Fixed number of optimizer steps (not epochs) so each run does identical work.
-  - Optional GPU-resident synthetic dataset to remove CPU dataloading/transfer bottlenecks.
-  - Measures only the *steady-state* region (warmup steps excluded).
-  - Uses Lightning DDP under torchrun correctly (devices=1 per process).
-
-------------------------------------------------------------
-Quick start (single node, 1..4 GPUs)
-------------------------------------------------------------
-
-# 0) See NICs (optional)
-ls -1 /sys/class/net
-ip -o link show | awk -F': ' '{print NR-1": "$2}'
-
-# 1) Minimal, safe NCCL/torch env (no hard-coded eth0):
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export TOKENIZERS_PARALLELISM=false
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG=WARN
-export NCCL_P2P_DISABLE=0
-export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=$(ls /sys/class/net | grep -E '^(ens|enp|eno|eth|bond|ib)' | head -n1)
-[ -z "$NCCL_SOCKET_IFNAME" ] && export NCCL_SOCKET_IFNAME="^lo,docker0"
-
-# CUDA allocator tweak (fine to keep)
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# 2) Kill any stragglers (optional)
-pkill -f scale_bench.py || true
-pkill -f torchrun || true
-
-# 3) Runs (IMPORTANT: --batch-size is PER GPU)
-# Suggested defaults: steps=400 warmup=50 (steady state measured steps=400)
-
-torchrun --standalone --nproc_per_node=1 scale_bench.py \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 2048 --precision bf16 \
-  --context-dim 16 --x-dim 512 --y-dim 64 \
-  --width 1024 --layers 4 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/gpu1
-
-torchrun --standalone --nproc_per_node=2 scale_bench.py \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 2048 --precision bf16 \
-  --context-dim 16 --x-dim 512 --y-dim 64 \
-  --width 1024 --layers 4 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/gpu2
-
-torchrun --standalone --nproc_per_node=3 scale_bench.py \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 2048 --precision bf16 \
-  --context-dim 16 --x-dim 512 --y-dim 64 \
-  --width 1024 --layers 4 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/gpu3
-
-torchrun --standalone --nproc_per_node=4 scale_bench.py \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 2048 --precision bf16 \
-  --context-dim 16 --x-dim 512 --y-dim 64 \
-  --width 1024 --layers 4 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/gpu4
-
-Notes:
-  - If scaling is still poor with this benchmark, it is very likely a *real* bottleneck
-    (GPU interconnect/topology, NCCL config, too-small batch, CPU frequency limits, etc.),
-    not a dataloader artifact.
-"""
+# Single-node strong-scaling benchmark runner for ContextualizedRegression using synthetic batched data.
 
 import os
 import time
 import json
-import math
 import argparse
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Dict, Optional
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
+from torch.utils.data import IterableDataset, DataLoader
 from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.strategies import DDPStrategy
 
-# ---- your package pieces ----
 from contextualized.regression import ContextualizedRegression
-from contextualized.regression.datamodules import ContextualizedRegressionDataModule
 
 
-# ---------------- launcher/cluster helpers ----------------
+# Torchrun helpers
 def under_torchrun() -> bool:
     e = os.environ
     return ("LOCAL_RANK" in e) or ("RANK" in e) or ("WORLD_SIZE" in e)
 
 
 def world_size() -> int:
-    try:
-        return int(os.environ.get("WORLD_SIZE", "1"))
-    except Exception:
-        return 1
+    return int(os.environ.get("WORLD_SIZE", "1"))
 
 
 def global_rank() -> int:
-    try:
-        return int(os.environ.get("RANK", "0"))
-    except Exception:
-        return 0
+    return int(os.environ.get("RANK", "0"))
 
 
 def local_rank() -> int:
-    try:
-        return int(os.environ.get("LOCAL_RANK", "0"))
-    except Exception:
-        return 0
+    return int(os.environ.get("LOCAL_RANK", "0"))
 
 
 def is_global_zero() -> bool:
     return global_rank() == 0
 
 
-# ---------------- env + perf ----------------
+# Environment defaults
 def set_env_defaults():
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -142,17 +55,12 @@ def set_env_defaults():
 
     if "NCCL_SOCKET_IFNAME" not in os.environ:
         try:
-            ifaces = [
-                d
-                for d in os.listdir("/sys/class/net")
-                if os.path.isdir(f"/sys/class/net/{d}")
-            ]
-            cand = next((i for i in ifaces if i not in ("lo", "docker0")), None)
+            ifaces = [d for d in os.listdir("/sys/class/net") if d not in ("lo", "docker0")]
+            cand = next((i for i in ifaces if i.startswith(("ens", "enp", "eno", "eth", "bond", "ib"))), None)
             os.environ["NCCL_SOCKET_IFNAME"] = cand or "^lo,docker0"
         except Exception:
             os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0"
 
-    # TF32 / matmul speedups (safe for benchmarking throughput)
     if torch.cuda.is_available():
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -168,7 +76,6 @@ def set_env_defaults():
             pass
 
     if under_torchrun() and torch.cuda.is_available():
-        # Ensures each rank uses its intended GPU even if something upstream is odd.
         try:
             torch.cuda.set_device(local_rank())
         except Exception:
@@ -203,57 +110,44 @@ def map_precision(p: str):
     return 32
 
 
-# ---------------- timing ----------------
+# Timing callback
 class SteadyStateStepTimer(Callback):
-    """
-    Times optimizer steps in a steady-state window:
-      - ignore first warmup_steps
-      - measure next measure_steps
-
-    Assumes accumulate_grad_batches == 1.
-    """
-
     def __init__(self, warmup_steps: int, measure_steps: int):
         super().__init__()
         self.warmup_steps = int(warmup_steps)
         self.measure_steps = int(measure_steps)
-        self._seen_steps = 0
+        self._seen = 0
         self.step_times = []
-        self._step_start_t = None
+        self._t0 = None
 
     @staticmethod
-    def _sync_if_cuda():
+    def _sync():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        s = self._seen_steps
-        if self.warmup_steps <= s < (self.warmup_steps + self.measure_steps):
-            self._sync_if_cuda()
-            self._step_start_t = time.time()
+        s = self._seen
+        if self.warmup_steps <= s < self.warmup_steps + self.measure_steps:
+            self._sync()
+            self._t0 = time.time()
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        s = self._seen_steps
-        if self.warmup_steps <= s < (self.warmup_steps + self.measure_steps):
-            self._sync_if_cuda()
-            dt = time.time() - (self._step_start_t or time.time())
-            self.step_times.append(dt)
+        s = self._seen
+        if self.warmup_steps <= s < self.warmup_steps + self.measure_steps:
+            self._sync()
+            self.step_times.append(time.time() - (self._t0 or time.time()))
+        self._seen += 1
 
-        self._seen_steps += 1
-
-    def measured_wall_time(self) -> float:
+    def measured_wall(self) -> float:
         return float(sum(self.step_times))
 
 
 def dist_max(value: float) -> float:
-    """
-    Returns max(value across ranks) if distributed is initialized; else returns value.
-    """
     try:
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized():
-            t = torch.tensor([value], device="cuda" if torch.cuda.is_available() else "cpu")
+            t = torch.tensor([value], device="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float64)
             dist.all_reduce(t, op=dist.ReduceOp.MAX)
             return float(t.item())
     except Exception:
@@ -261,84 +155,154 @@ def dist_max(value: float) -> float:
     return float(value)
 
 
-# ---------------- synthetic data ----------------
-def make_synthetic_tensors(
-    n: int,
-    c_dim: int,
-    x_dim: int,
-    y_dim: int,
-    device: torch.device,
-    seed: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    Generates a fixed buffer of synthetic data.
+# Synthetic batched iterable
+class SyntheticBatchStream(IterableDataset):
+    def __init__(
+        self,
+        batch_size: int,
+        c_dim: int,
+        x_dim: int,
+        y_dim: int,
+        buffer_batches: int,
+        buffer_mult: int,
+        seed: int,
+        pin: bool,
+    ):
+        super().__init__()
+        self.batch_size = int(batch_size)
+        self.c_dim = int(c_dim)
+        self.x_dim = int(x_dim)
+        self.y_dim = int(y_dim)
 
-    IMPORTANT: This runs once before timing begins. Keep n reasonable.
-    """
-    g = torch.Generator(device=device)
-    g.manual_seed(int(seed) + 1000 * global_rank())
+        self.n_batches = int(buffer_batches) * int(buffer_mult)
+        if self.n_batches <= 0:
+            raise ValueError("buffer_batches * buffer_mult must be >= 1")
 
-    C = torch.randn((n, c_dim), generator=g, device=device, dtype=torch.float32)
-    X = torch.randn((n, x_dim), generator=g, device=device, dtype=torch.float32)
-    Y = torch.randn((n, y_dim), generator=g, device=device, dtype=torch.float32)
-    return {"C": C, "X": X, "Y": Y}
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(seed) + 1000 * global_rank())
 
+        self.C = torch.randn((self.n_batches, self.batch_size, self.c_dim), generator=g, device="cpu", dtype=torch.float32)
+        self.X = torch.randn((self.n_batches, self.batch_size, self.x_dim), generator=g, device="cpu", dtype=torch.float32)
+        self.Y = torch.randn((self.n_batches, self.batch_size, self.y_dim), generator=g, device="cpu", dtype=torch.float32)
 
-# ---------------- model/trainer/datamodule ----------------
-def build_model(args) -> ContextualizedRegression:
-    # Uses your current link_fn handling (string keys are valid).
-    return ContextualizedRegression(
-        context_dim=args.context_dim,
-        x_dim=args.x_dim,
-        y_dim=args.y_dim,
-        num_archetypes=args.num_archetypes,
-        encoder_type=args.encoder_type,
-        encoder_kwargs={"width": args.width, "layers": args.layers, "link_fn": "identity"},
-        learning_rate=args.lr,
-        fit_intercept=True,
-        link_fn="identity",
-        loss_fn="mse",
-        model_regularizer="none",
-    )
+        if pin and torch.cuda.is_available():
+            self.C = self.C.pin_memory()
+            self.X = self.X.pin_memory()
+            self.Y = self.Y.pin_memory()
 
-
-def build_dm(args, C, X, Y) -> ContextualizedRegressionDataModule:
-    n = int(C.shape[0])
-    # Simple split; validation never runs in this benchmark (we pass only train_dataloader).
-    n_train = int(0.95 * n)
-    train_idx = np.arange(0, n_train, dtype=np.int64)
-    val_idx = np.arange(n_train, n, dtype=np.int64)
-
-    dm = ContextualizedRegressionDataModule(
-        C=C,
-        X=X,
-        Y=Y,
-        task_type="singletask_multivariate",
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=None,
-        predict_idx=None,
-        train_batch_size=args.batch_size,
-        val_batch_size=args.batch_size,
-        test_batch_size=args.batch_size,
-        predict_batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=bool(args.pin_memory),
-        persistent_workers=bool(args.num_workers > 0),
-        drop_last=True,
-        shuffle_train=False,  # let Lightning/DDP sampler handle partitioning; shuffle not needed for perf
-        shuffle_eval=False,
-        dtype=torch.float,
-    )
-    dm.prepare_data()
-    dm.setup()
-    return dm
+    def __iter__(self):
+        ws = world_size()
+        r = global_rank()
+        k = 0
+        while True:
+            b = (k * ws + r) % self.n_batches
+            yield {"contexts": self.C[b], "predictors": self.X[b], "outcomes": self.Y[b]}
+            k += 1
 
 
+def _as_2d(t: torch.Tensor) -> torch.Tensor:
+    # Accept [B, y, 1] or [B, 1, y] and squeeze the singleton dim
+    if t.ndim == 3:
+        if t.shape[-1] == 1:
+            # Convert [B, y, 1] -> [B, y]
+            t = t.squeeze(-1)
+        elif t.shape[1] == 1:
+            # Convert [B, 1, y] -> [B, y]
+            t = t.squeeze(1)
+    if t.ndim == 1:
+        return t.unsqueeze(-1)
+    if t.ndim == 2:
+        return t
+    raise RuntimeError(f"Expected 1D or 2D tensor (or squeezable 3D), got shape {tuple(t.shape)}")
+
+
+def _canonicalize_y(y: torch.Tensor, B: int, y_dim: int, name: str) -> torch.Tensor:
+    y = _as_2d(y)
+    if y.shape == (B, y_dim):
+        return y
+    if y.shape == (y_dim, B):
+        return y.transpose(0, 1)
+    if y_dim == 1 and y.shape == (B,):
+        return y.view(B, 1)
+    raise RuntimeError(f"{name} has incompatible shape {tuple(y.shape)}; expected [{B},{y_dim}] or [{y_dim},{B}].")
+
+
+def _extract_mu_hat(out: Any) -> torch.Tensor:
+    # Prefer mu_hat as y_pred for this benchmark
+    if torch.is_tensor(out):
+        return out
+
+    if isinstance(out, dict):
+        for k in ("mu_hat", "mu", "y_pred", "y_hat", "pred"):
+            if k in out and torch.is_tensor(out[k]):
+                return out[k]
+        raise RuntimeError(f"Forward returned dict without mu_hat/y_hat keys: {list(out.keys())}")
+
+    if isinstance(out, (tuple, list)):
+        tensors = [t for t in out if torch.is_tensor(t)]
+        if len(tensors) >= 2:
+            return tensors[1]
+        if len(tensors) == 1:
+            return tensors[0]
+        raise RuntimeError("Forward returned tuple/list with no tensors.")
+
+    raise RuntimeError(f"Unsupported forward output type: {type(out)}")
+
+
+# Lightning bench module
+class BenchModule(pl.LightningModule):
+    def __init__(self, inner: ContextualizedRegression, lr: float, y_dim: int):
+        super().__init__()
+        self.inner = inner
+        self.lr = float(lr)
+        self.y_dim = int(y_dim)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+    def training_step(self, batch, batch_idx):
+        device = self.device
+
+        C = batch["contexts"].to(device, non_blocking=True)
+        X = batch["predictors"].to(device, non_blocking=True)
+        Y = batch["outcomes"].to(device, non_blocking=True)
+
+        B = C.shape[0]
+        Y_true = _canonicalize_y(Y, B, self.y_dim, "Y_true")
+
+        # Prefer calling with dict to match internal conventions
+        out = self.inner({"contexts": C, "predictors": X, "outcomes": Y_true})
+
+        mu_hat = _extract_mu_hat(out)
+        Y_pred = _canonicalize_y(mu_hat, B, self.y_dim, "Y_pred(mu_hat)")
+
+        loss = F.mse_loss(Y_pred, Y_true)
+        return loss
+
+
+# Batch sizing
+def resolve_batch_sizes(args, ws: int) -> Tuple[int, int]:
+    if args.global_batch_size is None:
+        per_gpu = int(args.batch_size)
+        return per_gpu, per_gpu * ws
+    gbs = int(args.global_batch_size)
+    if gbs % ws != 0:
+        raise ValueError(f"--global-batch-size {gbs} must be divisible by world_size {ws}")
+    return gbs // ws, gbs
+
+
+# Trainer
 def build_trainer(args, timer: SteadyStateStepTimer) -> pl.Trainer:
-    if torch.cuda.is_available():
+    use_cuda = torch.cuda.is_available() and (args.run_device != "cpu")
+
+    if use_cuda:
         accelerator = "gpu"
-        devices = 1 if under_torchrun() else min(args.devices, torch.cuda.device_count())
+
+        if under_torchrun():
+            devices = 1
+        else:
+            devices = min(int(args.devices), torch.cuda.device_count())
+
         strategy = (
             DDPStrategy(
                 find_unused_parameters=False,
@@ -354,16 +318,15 @@ def build_trainer(args, timer: SteadyStateStepTimer) -> pl.Trainer:
         devices = 1
         strategy = "auto"
 
-    # We benchmark *steps*, not epochs.
-    max_steps = args.warmup_steps + args.steps
+    max_steps = int(args.warmup_steps) + int(args.steps)
 
-    trainer = pl.Trainer(
+    return pl.Trainer(
         accelerator=accelerator,
         devices=devices,
         strategy=strategy,
         precision=map_precision(args.precision),
         max_steps=max_steps,
-        max_epochs=10_000,  # irrelevant when max_steps is set
+        max_epochs=10_000,
         logger=False,
         enable_checkpointing=False,
         enable_progress_bar=False,
@@ -371,16 +334,13 @@ def build_trainer(args, timer: SteadyStateStepTimer) -> pl.Trainer:
         log_every_n_steps=50,
         callbacks=[timer],
         inference_mode=False,
-        detect_anomaly=False,
         enable_model_summary=False,
-        use_distributed_sampler=True,
         accumulate_grad_batches=1,
         limit_val_batches=0,
     )
-    return trainer
 
 
-# ---------------- benchmark runner ----------------
+# Results
 @dataclass
 class Result:
     world_size: int
@@ -395,89 +355,6 @@ class Result:
     p95_step_s: float
 
 
-def run_bench(args) -> Result:
-    ws = world_size() if under_torchrun() else int(args.devices)
-    dev = torch.device("cuda", local_rank()) if (args.data_device == "cuda" and torch.cuda.is_available()) else torch.device("cpu")
-
-    # If auto: keep data on GPU when available (this removes input bottlenecks).
-    if args.data_device == "auto":
-        if torch.cuda.is_available():
-            dev = torch.device("cuda", local_rank())
-        else:
-            dev = torch.device("cpu")
-
-    # Dataloader workers cannot safely handle CUDA tensors.
-    if dev.type == "cuda" and args.num_workers != 0:
-        if is_global_zero():
-            print("NOTE: forcing --num-workers=0 because data-device is CUDA.")
-        args.num_workers = 0
-
-    # Build fixed synthetic buffer (not timed)
-    n = int(args.batch_size * args.buffer_batches)
-    tensors = make_synthetic_tensors(
-        n=n,
-        c_dim=args.context_dim,
-        x_dim=args.x_dim,
-        y_dim=args.y_dim,
-        device=dev,
-        seed=args.seed,
-    )
-
-    dm = build_dm(args, tensors["C"], tensors["X"], tensors["Y"])
-    model = build_model(args)
-
-    timer = SteadyStateStepTimer(args.warmup_steps, args.steps)
-    trainer = build_trainer(args, timer)
-
-    if is_global_zero():
-        print(
-            "\nConfig:",
-            json.dumps(
-                {
-                    "torchrun": under_torchrun(),
-                    "world_size": ws,
-                    "local_rank": local_rank(),
-                    "batch_size_per_gpu": args.batch_size,
-                    "global_batch_size": args.batch_size * ws,
-                    "steps_measured": args.steps,
-                    "steps_warmup": args.warmup_steps,
-                    "buffer_samples": n,
-                    "data_device": str(dev),
-                    "precision": map_precision(args.precision),
-                },
-                indent=2,
-            ),
-        )
-
-    trainer.fit(model, train_dataloaders=dm.train_dataloader())
-
-    measured_wall = timer.measured_wall_time()
-    measured_wall = dist_max(measured_wall)  # slowest rank dictates wall time
-
-    measured_steps = int(args.steps)
-    global_batch = int(args.batch_size * ws)
-    samples_total = global_batch * measured_steps
-    throughput = samples_total / max(measured_wall, 1e-12)
-    per_gpu = throughput / max(ws, 1)
-
-    step_times = timer.step_times[:] if timer.step_times else [float("nan")]
-    avg_step = float(np.mean(step_times))
-    p95_step = float(np.percentile(step_times, 95)) if len(step_times) > 1 else float("nan")
-
-    return Result(
-        world_size=ws,
-        batch_size_per_gpu=int(args.batch_size),
-        global_batch_size=int(global_batch),
-        warmup_steps=int(args.warmup_steps),
-        measured_steps=int(measured_steps),
-        measured_wall_s=float(measured_wall),
-        throughput_samples_per_s=float(throughput),
-        per_gpu_throughput_samples_per_s=float(per_gpu),
-        avg_step_s=float(avg_step),
-        p95_step_s=float(p95_step),
-    )
-
-
 def save_result(outdir: str, res: Result):
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, "result.json")
@@ -486,15 +363,106 @@ def save_result(outdir: str, res: Result):
     return path
 
 
-# ---------------- main ----------------
+# Main bench
+def run_bench(args) -> Result:
+    ws = world_size() if under_torchrun() else int(args.devices)
+    per_gpu_bs, global_bs = resolve_batch_sizes(args, ws)
+
+    pin = args.data_device == "cpu_pinned"
+
+    ds = SyntheticBatchStream(
+        batch_size=per_gpu_bs,
+        c_dim=args.context_dim,
+        x_dim=args.x_dim,
+        y_dim=args.y_dim,
+        buffer_batches=args.buffer_batches,
+        buffer_mult=args.buffer_mult,
+        seed=args.seed,
+        pin=pin,
+    )
+
+    dl = DataLoader(ds, batch_size=None, num_workers=0, pin_memory=False)
+
+    inner = ContextualizedRegression(
+        context_dim=args.context_dim,
+        x_dim=args.x_dim,
+        y_dim=args.y_dim,
+        num_archetypes=args.num_archetypes,
+        encoder_type=args.encoder_type,
+        encoder_kwargs={"width": args.width, "layers": args.layers, "link_fn": "identity"},
+        learning_rate=args.lr,
+        fit_intercept=True,
+        link_fn="identity",
+        loss_fn="mse",
+        model_regularizer="none",
+    )
+
+    model = BenchModule(inner=inner, lr=args.lr, y_dim=args.y_dim)
+
+    timer = SteadyStateStepTimer(args.warmup_steps, args.steps)
+    trainer = build_trainer(args, timer)
+
+    if is_global_zero():
+        buffer_batches_total = int(args.buffer_batches) * int(args.buffer_mult)
+        buffer_samples_per_rank = int(per_gpu_bs) * buffer_batches_total
+        print(
+            "\nConfig:",
+            json.dumps(
+                {
+                    "torchrun": under_torchrun(),
+                    "world_size": ws,
+                    "local_rank": local_rank(),
+                    "batch_size_per_gpu": per_gpu_bs,
+                    "global_batch_size": global_bs,
+                    "steps_measured": int(args.steps),
+                    "steps_warmup": int(args.warmup_steps),
+                    "buffer_batches_total": buffer_batches_total,
+                    "buffer_samples_per_rank": buffer_samples_per_rank,
+                    "buffer_samples_global_approx": buffer_samples_per_rank * int(ws),
+                    "run_device": args.run_device,
+                    "data_device": args.data_device,
+                    "pin_memory": pin,
+                    "precision": map_precision(args.precision),
+                },
+                indent=2,
+            ),
+        )
+
+    trainer.fit(model, train_dataloaders=dl)
+
+    measured_wall = dist_max(timer.measured_wall())
+
+    measured_steps = int(args.steps)
+    samples_total = global_bs * measured_steps
+    throughput = samples_total / max(measured_wall, 1e-12)
+    per_gpu_thr = throughput / max(ws, 1)
+
+    step_times = timer.step_times[:] if timer.step_times else [float("nan")]
+    avg_step = float(np.mean(step_times))
+    p95_step = float(np.percentile(step_times, 95)) if len(step_times) > 1 else float("nan")
+
+    return Result(
+        world_size=int(ws),
+        batch_size_per_gpu=int(per_gpu_bs),
+        global_batch_size=int(global_bs),
+        warmup_steps=int(args.warmup_steps),
+        measured_steps=int(measured_steps),
+        measured_wall_s=float(measured_wall),
+        throughput_samples_per_s=float(throughput),
+        per_gpu_throughput_samples_per_s=float(per_gpu_thr),
+        avg_step_s=float(avg_step),
+        p95_step_s=float(p95_step),
+    )
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=400, help="Measured optimizer steps")
-    ap.add_argument("--warmup-steps", type=int, default=50, help="Warmup steps excluded from timing")
+    ap.add_argument("--steps", type=int, default=400)
+    ap.add_argument("--warmup-steps", type=int, default=50)
 
-    ap.add_argument("--batch-size", type=int, default=2048, help="Per-GPU batch size")
-    ap.add_argument("--num-workers", type=int, default=0)
-    ap.add_argument("--pin-memory", action="store_true", default=False)
+    ap.add_argument("--batch-size", type=int, default=2048, help="Per-GPU batch size (ignored if --global-batch-size set)")
+    ap.add_argument("--global-batch-size", type=int, default=None, help="Fixed global batch for strong scaling")
+
     ap.add_argument("--precision", type=str, default="bf16")
 
     ap.add_argument("--context-dim", type=int, default=16)
@@ -507,9 +475,12 @@ def parse_args():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-3)
 
-    ap.add_argument("--buffer-batches", type=int, default=32, help="Dataset buffer size = batch_size * buffer_batches")
-    ap.add_argument("--data-device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
-    ap.add_argument("--devices", type=int, default=1, help="Only used when NOT under torchrun")
+    ap.add_argument("--buffer-batches", type=int, default=16, help="Buffer depth in batches (per rank)")
+    ap.add_argument("--buffer-mult", type=int, default=4, help="Extra multiplier on buffer size (per rank)")
+
+    ap.add_argument("--data-device", choices=["cpu", "cpu_pinned"], default="cpu_pinned")
+    ap.add_argument("--run-device", choices=["auto", "cpu"], default="auto")
+    ap.add_argument("--devices", type=int, default=1, help="Used only when NOT under torchrun")
 
     ap.add_argument("--ddp-timeout", type=int, default=180)
     ap.add_argument("--seed", type=int, default=123)
@@ -522,17 +493,14 @@ def main():
     set_env_defaults()
     args = parse_args()
 
-    if args.data_device == "cpu":
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""  # ensure no accidental CUDA use
+    if args.run_device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     res = run_bench(args)
 
     if is_global_zero():
         path = save_result(args.outdir, res)
-        print(
-            "\nResult:",
-            json.dumps(res.__dict__, indent=2),
-        )
+        print("\nResult:", json.dumps(res.__dict__, indent=2))
         print(f"\nSaved → {path}")
 
 

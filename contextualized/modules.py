@@ -7,6 +7,24 @@ from torch import nn
 
 from contextualized.functions import LINK_FUNCTIONS
 
+def _resolve_link_fn(maybe_link):
+    """
+    Accepts either:
+    - a string key (looked up in LINK_FUNCTIONS), or
+    - a callable (returned as-is, including functools.partial)
+    """
+    if isinstance(maybe_link, str):
+        try:
+            return LINK_FUNCTIONS[maybe_link]
+        except KeyError as e:
+            raise KeyError(
+                f"Unknown link_fn '{maybe_link}'. "
+                f"Valid options: {list(LINK_FUNCTIONS.keys())}"
+            ) from e
+    if callable(maybe_link):
+        return maybe_link
+    raise TypeError(f"link_fn must be str or callable, got {type(maybe_link).__name__}")
+
 
 class SoftSelect(nn.Module):
     """
@@ -60,30 +78,10 @@ class SoftSelect(nn.Module):
 
 
 class Explainer(SoftSelect):
-    """
-    2D subtype-archetype parameter sharing
-    """
-
+    """ 2D subtype-archetype parameter sharing """
     def __init__(self, k, out_shape):
         super().__init__((k,), out_shape)
 
-def _resolve_link_fn(maybe_link):
-    """
-    Accepts either:
-      - a string key (looked up in LINK_FUNCTIONS), or
-      - a callable (returned as-is, including functools.partial)
-    """
-    if isinstance(maybe_link, str):
-        try:
-            return LINK_FUNCTIONS[maybe_link]
-        except KeyError as e:
-            raise KeyError(
-                f"Unknown link_fn '{maybe_link}'. "
-                f"Valid options: {list(LINK_FUNCTIONS.keys())}"
-            ) from e
-    if callable(maybe_link):
-        return maybe_link
-    raise TypeError(f"link_fn must be str or callable, got {type(maybe_link).__name__}")
 
 
 
@@ -139,7 +137,6 @@ class NGAM(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        # Internal NAM pieces should be identity-linked; the global link is applied after summation.
         per_feat_link = "identity"
 
         self.nams = nn.ModuleList(

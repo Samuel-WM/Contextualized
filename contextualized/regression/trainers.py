@@ -3,18 +3,20 @@ PyTorch-Lightning trainers used for Contextualized regression.
 """
 
 from typing import Any, Tuple, List, Dict, Optional
+
 import numpy as np
 import torch
 import torch.distributed as dist
-import pytorch_lightning as pl
-from pytorch_lightning.plugins.environments import LightningEnvironment
+import lightning.pytorch as pl
+from lightning.pytorch.plugins.environments import LightningEnvironment
 import os
-from pytorch_lightning.strategies import DDPStrategy
-
+from lightning.pytorch.strategies import DDPStrategy
 
 
 def _stack_from_preds(preds: List[dict], key: str) -> torch.Tensor:
-    """Concatenate a tensor field from the list of batch dicts returned by predict()."""
+    """
+    Concatenate a tensor field from the list of batch dicts returned by predict().
+    """
     preds = _flatten_pl_predict_output(preds)
     parts = []
     for p in preds:
@@ -36,8 +38,9 @@ def _is_main_process() -> bool:
 def _flatten_pl_predict_output(preds):
     """
     Lightning can return:
-      - list[dict]  (single dataloader)
-      - list[list[dict]] (multiple dataloaders)
+    - list[dict] (single dataloader)
+    - list[list[dict]] (multiple dataloaders)
+
     Normalize to list[dict].
     """
     if preds is None:
@@ -88,7 +91,10 @@ def _pack_keys_from_preds(preds: list, keys: Tuple[str, ...]) -> Dict[str, np.nd
 def _gather_object_to_rank0(obj):
     """
     Gather arbitrary Python objects to rank 0.
-    Returns list[obj] on rank 0, None on other ranks.
+
+    Returns:
+    - list[obj] on rank 0
+    - None on other ranks
     """
     if not _is_distributed():
         return [obj]
@@ -106,7 +112,9 @@ def _gather_object_to_rank0(obj):
         return None
 
 
-def _merge_packed_payloads(payloads: List[Optional[Dict[str, np.ndarray]]]) -> Dict[str, np.ndarray]:
+def _merge_packed_payloads(
+    payloads: List[Optional[Dict[str, np.ndarray]]],
+) -> Dict[str, np.ndarray]:
     """
     Merge list[dict[str, np.ndarray]] -> dict[str, np.ndarray] by concatenation axis 0.
     """
@@ -120,7 +128,11 @@ def _merge_packed_payloads(payloads: List[Optional[Dict[str, np.ndarray]]]) -> D
         keys.update(p.keys())
 
     for k in keys:
-        chunks = [p[k] for p in payloads if (k in p) and (p[k] is not None) and (len(p[k]) > 0)]
+        chunks = [
+            p[k]
+            for p in payloads
+            if (k in p) and (p[k] is not None) and (len(p[k]) > 0)
+        ]
         if not chunks:
             continue
         merged[k] = np.concatenate(chunks, axis=0)
@@ -157,78 +169,89 @@ def _stable_sort_and_dedupe(payload: Dict[str, np.ndarray]) -> Dict[str, np.ndar
     return out
 
 
-
-def _gather_predict_payload(preds, keys: Tuple[str, ...]) -> Optional[Dict[str, np.ndarray]]:
+def _gather_predict_payload(
+    preds, keys: Tuple[str, ...]
+) -> Optional[Dict[str, np.ndarray]]:
     """
     Packs requested keys from local preds, gathers to rank0 under DDP, merges, and
     stable-sorts/dedupes by orig_idx (if present).
-    Returns payload dict on rank0; returns None on non-rank0 in DDP.
+
+    Returns:
+    - payload dict on rank 0
+    - None on non-rank0 in DDP
     """
     local = _pack_keys_from_preds(preds, keys)
 
     gathered = _gather_object_to_rank0(local)
     if gathered is None:
-        return None  # non-rank0 DDP
+        return None
 
     merged = _merge_packed_payloads(gathered)
     merged = _stable_sort_and_dedupe(merged)
     return merged
 
 
-
 class RegressionTrainer(pl.Trainer):
     """
     Trains the contextualized.regression lightning_modules
-    and provides convenience prediction helpers that reshape
-    batched outputs into expected numpy arrays without relying
-    on model-private _*reshape helpers.
     """
 
     @torch.no_grad()
-    def predict_params(self, model: pl.LightningModule, dataloader) -> Tuple[np.ndarray, np.ndarray]:
+    def predict_params(
+        self, model: pl.LightningModule, dataloader
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns context-specific regression models
+        - beta (numpy.ndarray): (n, y_dim, x_dim)
+        - mu (numpy.ndarray): (n, y_dim, [1 if normal regression, x_dim if univariate])
+        """
         preds = super().predict(model, dataloader)
 
         payload = _gather_predict_payload(preds, keys=("idx", "orig_idx", "betas", "mus"))
         if payload is None:
-            # non-rank0 DDP: return nothing to avoid duplicated outputs
             return None, None
 
-
         if "betas" not in payload or "mus" not in payload:
-            raise RuntimeError("predict_params: predict_step must return 'betas' and 'mus' (and ideally 'orig_idx').")
+            raise RuntimeError(
+                "predict_params: predict_step must return 'betas' and 'mus' (and ideally 'orig_idx')."
+            )
 
         return payload["betas"], payload["mus"]
 
-
     @torch.no_grad()
     def predict_y(self, model: pl.LightningModule, dataloader) -> np.ndarray:
+        """
+        Returns context-specific predictions of the response Y
+        - y_hat (numpy.ndarray): (n, y_dim, [1 if normal regression, x_dim if univariate])
+        """
         preds = super().predict(model, dataloader)
 
-        # Prefer lightweight gather, but allow legacy keys if present.
-        payload = _gather_predict_payload(preds, keys=("idx", "orig_idx", "betas", "mus"))
+        payload = _gather_predict_payload(
+            preds, keys=("idx", "orig_idx", "contexts", "predictors", "betas", "mus")
+        )
+
         if payload is None:
-            return None  # non-rank0 DDP
+            return None
 
         if "betas" not in payload or "mus" not in payload:
             raise RuntimeError("predict_y: predict_step must return 'betas' and 'mus'.")
 
         betas = torch.as_tensor(payload["betas"])
-        mus   = torch.as_tensor(payload["mus"])
+        mus = torch.as_tensor(payload["mus"])
 
-        # If legacy contexts/predictors were returned and gathered, use them.
         if ("contexts" in payload) and ("predictors" in payload):
             C = torch.as_tensor(payload["contexts"])
             X = torch.as_tensor(payload["predictors"])
         else:
-            # Option A path: reconstruct from dataset via dataset-local idx (NOT orig_idx)
             ds = getattr(dataloader, "dataset", None)
             if ds is None:
-                raise RuntimeError("predict_y: dataloader has no .dataset; cannot reconstruct C/X.")
+                raise RuntimeError(
+                    "predict_y: dataloader has no .dataset; cannot reconstruct C/X."
+                )
 
             idx_np = payload["idx"].astype(np.int64)
             idx_t = torch.as_tensor(idx_np, dtype=torch.long)
 
-            # Support Subset wrapper if user wrapped loaders externally
             if hasattr(ds, "dataset") and hasattr(ds, "indices"):
                 base = ds.dataset
                 if not (hasattr(base, "C") and hasattr(base, "X")):
@@ -239,11 +262,12 @@ class RegressionTrainer(pl.Trainer):
                 X = base.X[base_pos_t]
             else:
                 if not (hasattr(ds, "C") and hasattr(ds, "X")):
-                    raise RuntimeError("predict_y: dataset must expose .C and .X tensors for Option A prediction.")
+                    raise RuntimeError(
+                        "predict_y: dataset must expose .C and .X tensors for Option A prediction."
+                    )
                 C = ds.C[idx_t]
                 X = ds.X[idx_t]
 
-            # dtype align
             if torch.is_tensor(C):
                 C = C.to(dtype=betas.dtype)
             else:
@@ -254,39 +278,39 @@ class RegressionTrainer(pl.Trainer):
             else:
                 X = torch.as_tensor(X, dtype=betas.dtype)
 
-
         with torch.no_grad():
             yhat = model._predict_y(C, X, betas, mus).detach().cpu().numpy()
 
         return yhat
 
 
-
-
 class CorrelationTrainer(RegressionTrainer):
     """
     Trains the contextualized.regression correlation lightning_modules
-    and exposes a helper to compute context-specific correlation matrices.
     """
 
     @torch.no_grad()
     def predict_correlation(self, model: pl.LightningModule, dataloader) -> np.ndarray:
+        """
+        Returns context-specific correlation networks containing Pearson's correlation coefficient
+        - correlation (numpy.ndarray): (n, x_dim, x_dim)
+        """
         preds = super().predict(model, dataloader)
         preds_flat = _flatten_pl_predict_output(preds)
 
-        # If model returns correlations directly, gather and reorder them.
         if preds_flat and ("correlations" in preds_flat[0]):
             payload = _gather_predict_payload(preds, keys=("orig_idx", "correlations"))
             if payload is None:
-                return None  # non-rank0 DDP
+                return None
             if "correlations" not in payload:
-                raise RuntimeError("predict_correlation: predict_step returned no 'correlations'.")
+                raise RuntimeError(
+                    "predict_correlation: predict_step returned no 'correlations'."
+                )
             return payload["correlations"]
 
-        # Fallback: derive from betas
         betas, _ = self.predict_params(model, dataloader)
         if betas is None:
-            return None  # non-rank0 DDP
+            return None
 
         signs = np.sign(betas)
         signs[signs != np.transpose(signs, (0, 2, 1))] = 0
@@ -294,48 +318,38 @@ class CorrelationTrainer(RegressionTrainer):
         return correlations
 
 
-
 class MarkovTrainer(CorrelationTrainer):
     """
     Trains the contextualized.regression markov graph lightning_modules
-    and exposes a helper to compute context-specific precision matrices.
     """
 
     @torch.no_grad()
     def predict_precision(self, model: pl.LightningModule, dataloader) -> np.ndarray:
         """
-        Returns context-specific precision matrix under a Gaussian graphical model.
-
+        Returns context-specific precision matrix under a Gaussian graphical model
         Assuming all diagonal precisions are equal and constant over context,
         this is equivalent to the negative of the multivariate regression coefficient.
-
-        Returns
-        -------
-        precision : (n, x_dim, x_dim)
+        - precision (numpy.ndarray): (n, x_dim, x_dim)
         """
-        # A trick in the markov lightning_module predict_step ensures the
-        # correlation output corresponds (up to sign) to precision entries.
         return -super().predict_correlation(model, dataloader)
 
 
-
 def choose_lightning_environment() -> LightningEnvironment:
-    # If you have a custom Environment subclass, wire it here.
-    # Otherwise, the default LightningEnvironment is fine.
+    """
+    Returns the Lightning environment plugin used for single-process runs.
+    """
     return LightningEnvironment()
+
 
 def make_trainer_with_env(trainer_cls, **trainer_kwargs):
     """
     Factory that respects caller-provided `devices` and `strategy`.
-    FIXED: Don't inject LightningEnvironment when torchrun is managing processes.
+    Does not inject LightningEnvironment when torchrun is managing processes.
     """
     import os
-    
-    # Check if we're under torchrun (WORLD_SIZE > 1 means torchrun is managing)
+
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    
-    # Only inject LightningEnvironment for single-process runs
-    # When torchrun is active, Lightning will auto-detect TorchElasticEnvironment
+
     if "plugins" not in trainer_kwargs and world_size == 1:
         env = choose_lightning_environment()
         trainer_kwargs["plugins"] = [env]

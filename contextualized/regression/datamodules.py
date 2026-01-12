@@ -31,9 +31,7 @@ def _to_tensor(x: TensorLike, dtype: torch.dtype) -> torch.Tensor:
         return x.to(dtype=dtype, copy=False)
     if isinstance(x, (pd.DataFrame, pd.Series)):
         x = x.to_numpy(copy=False)
-    # np.ndarray -> avoid copy where possible
     return torch.as_tensor(x, dtype=dtype)
-
 
 
 def _maybe_index(x: torch.Tensor, idx: IndexLike) -> torch.Tensor:
@@ -44,8 +42,8 @@ def _maybe_index(x: torch.Tensor, idx: IndexLike) -> torch.Tensor:
     if isinstance(idx, np.ndarray):
         idx = torch.as_tensor(idx, dtype=torch.long)
         return x[idx]
-    # assume Sequence[int]
     return x[torch.as_tensor(idx, dtype=torch.long)]
+
 
 def _to_index_tensor(idx: IndexLike) -> Optional[torch.Tensor]:
     """Normalize an index-like into a 1D CPU LongTensor."""
@@ -56,9 +54,9 @@ def _to_index_tensor(idx: IndexLike) -> Optional[torch.Tensor]:
     elif isinstance(idx, np.ndarray):
         out = torch.as_tensor(idx, dtype=torch.long, device="cpu")
     else:
-        # assume Sequence[int]
         out = torch.as_tensor(idx, dtype=torch.long, device="cpu")
-    return out.view(-1)  # ensure 1D
+    return out.view(-1)
+
 
 class ContextualizedRegressionDataModule(pl.LightningDataModule):
     """
@@ -80,7 +78,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         Y: Optional[TensorLike],
         *,
         task_type: str,
-        # splits: pass explicit index arrays OR a splitter callable
         train_idx: IndexLike = None,
         val_idx: IndexLike = None,
         test_idx: IndexLike = None,
@@ -89,7 +86,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
                      Tuple[IndexLike, IndexLike, IndexLike]]
         ] = None,
-        # dataloader config
         train_batch_size: int = 32,
         val_batch_size: int = 32,
         test_batch_size: int = 32,
@@ -101,7 +97,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         shuffle_train: bool = True,
         shuffle_eval: bool = False,
         dtype: torch.dtype = torch.float,
-
     ):
         super().__init__()
         if task_type not in TASK_TO_DATASET:
@@ -111,19 +106,16 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             )
         self.task_type = task_type
 
-        # raw inputs (convert in setup)
         self._C_raw = C
         self._X_raw = X
         self._Y_raw = Y
 
-        # split config
         self.train_idx = train_idx
         self.val_idx = val_idx
         self.test_idx = test_idx
         self.predict_idx = predict_idx
         self.splitter = splitter
 
-        # dl config
         self.train_batch_size = train_batch_size
         self.val_batch_size = val_batch_size
         self.test_batch_size = test_batch_size
@@ -136,8 +128,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         self.shuffle_eval = shuffle_eval
         self.dtype = dtype
 
-
-        # will be set in setup()
         self.C: Optional[torch.Tensor] = None
         self.X: Optional[torch.Tensor] = None
         self.Y: Optional[torch.Tensor] = None
@@ -147,37 +137,30 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         self.ds_test = None
         self.ds_predict = None
 
-    # One-time downloads or heavy ops would go here; we have none.
     def prepare_data(self) -> None:
         pass
 
     def setup(self, stage: Optional[str] = None) -> None:
-        # Convert inputs to tensors
         C = _to_tensor(self._C_raw, self.dtype)
         X = _to_tensor(self._X_raw, self.dtype)
         Y = None if self._Y_raw is None else _to_tensor(self._Y_raw, self.dtype)
 
-        # Basic shape sanity could be added here if desired.
-
-        # If no explicit indices were given, allow a splitter to define them.
         if self.train_idx is None and self.val_idx is None and self.test_idx is None:
             if self.splitter is not None:
                 tr, va, te = self.splitter(C, X, Y)
                 self.train_idx, self.val_idx, self.test_idx = tr, va, te
 
-        # If predict_idx not given, default to test indices (or full range if all None)
         if self.predict_idx is None:
             if self.test_idx is not None:
                 self.predict_idx = self.test_idx
             else:
                 self.predict_idx = torch.arange(C.shape[0], dtype=torch.long)
 
-        # Slice tensors per split (map-style datasets rely on correct len() for sharding)
         def _mk_dataset(idx: IndexLike):
             if idx is None:
                 return None
 
-            idx_t = _to_index_tensor(idx)  # <-- NEW: stable mapping to original rows
+            idx_t = _to_index_tensor(idx)
 
             C_s = _maybe_index(C, idx_t)
             X_s = _maybe_index(X, idx_t)
@@ -185,25 +168,17 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             ds_cls = TASK_TO_DATASET[self.task_type]
 
             if Y_s is None:
-                # Allow unsupervised / network-style usage where Y is omitted.
-                # In that case, use X as a dummy target so shapes line up.
                 Y_s = X_s
 
-            # IMPORTANT: pass orig_idx so every item can report its original row id
             return ds_cls(C_s, X_s, Y_s, orig_idx=idx_t, dtype=self.dtype)
-
-
-
 
         self.ds_train = _mk_dataset(self.train_idx)
         self.ds_val = _mk_dataset(self.val_idx)
         self.ds_test = _mk_dataset(self.test_idx)
         self.ds_predict = _mk_dataset(self.predict_idx)
 
-        # Keep tensors for potential later use
         self.C, self.X, self.Y = C, X, Y
 
-    # ---- Dataloaders ----
     def _common_dl_kwargs(self, batch_size: int, *, drop_last: Optional[bool] = None) -> Dict:
         return {
             "batch_size": batch_size,
@@ -212,9 +187,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             "persistent_workers": bool(self.num_workers > 0 and self.persistent_workers),
             "drop_last": self.drop_last if drop_last is None else bool(drop_last),
         }
-
-
-
 
     def train_dataloader(self) -> DataLoader:
         if self.ds_train is None:
@@ -231,7 +203,6 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset=self.ds_val,
             shuffle=self.shuffle_eval,
-            # NEVER drop samples for eval (avoids silent data loss / mis-ordering)
             **self._common_dl_kwargs(self.val_batch_size, drop_last=False),
         )
 
@@ -252,4 +223,3 @@ class ContextualizedRegressionDataModule(pl.LightningDataModule):
             shuffle=False,
             **self._common_dl_kwargs(self.predict_batch_size, drop_last=False),
         )
-

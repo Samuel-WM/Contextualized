@@ -7,7 +7,7 @@ from contextualized.regression import (
     ContextualizedRegression,
 )
 from contextualized.easy.wrappers import SKLearnWrapper
-from contextualized.regression.trainers import RegressionTrainer  # <-- updated import
+from contextualized.regression.trainers import RegressionTrainer
 
 
 class ContextualizedRegressor(SKLearnWrapper):
@@ -32,17 +32,14 @@ class ContextualizedRegressor(SKLearnWrapper):
         elif self.num_archetypes > 0:
             constructor = ContextualizedRegression
         else:
-            print(
-                f"""
-                Was told to construct a ContextualizedRegressor with {self.num_archetypes}
-                archetypes, but this should be a non-negative integer."""
+            raise ValueError(
+                f"num_archetypes must be a non-negative integer, got {self.num_archetypes}."
             )
 
-        # Wrapper will accept these; no need to expose DataModule specifics here.
+
         extra_model_kwargs = ["base_param_predictor", "base_y_predictor", "y_dim"]
         extra_data_kwargs = ["Y_val"]
         trainer_constructor = RegressionTrainer
-
         super().__init__(
             constructor,
             extra_model_kwargs,
@@ -51,6 +48,5 @@ class ContextualizedRegressor(SKLearnWrapper):
             **kwargs,
         )
 
-    # Preserve legacy behavior that Y is expected/required for regression fits
     def _split_train_data(self, C, X, Y=None, Y_required=False, **kwargs):
         return super()._split_train_data(C, X, Y, Y_required=True, **kwargs)

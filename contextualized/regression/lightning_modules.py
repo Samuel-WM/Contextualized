@@ -10,19 +10,18 @@ g: Link Function for contextualized generalized linear models.
 
 Implemented with PyTorch Lightning
 """
-# For distributed runs, use the ContextualizedRegressionDataModule which returns
-# map-style datasets and allows Lightning's Trainer to auto-shard with DDP.
-from .datamodules import ContextualizedRegressionDataModule  # noqa: F401
+
+from .datamodules import ContextualizedRegressionDataModule  
 
 from abc import abstractmethod
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from contextualized.regression.regularizers import REGULARIZERS
-from contextualized.regression.losses import MSE   
-from contextualized.functions import LINK_FUNCTIONS
 
+from contextualized.regression.regularizers import REGULARIZERS
+from contextualized.regression.losses import MSE
+from contextualized.functions import LINK_FUNCTIONS
 
 from contextualized.regression.metamodels import (
     NaiveMetamodel,
@@ -33,9 +32,15 @@ from contextualized.regression.metamodels import (
     MULTITASK_METAMODELS,
 )
 
-# --- Accept both string registry keys and callables for link_fn / loss_fn ---
+
 def _resolve_registry_or_callable(maybe_obj, registry, name: str):
-    """Return a function from a registry by key, or the callable directly."""
+    """
+
+    :param maybe_obj:
+    :param registry:
+    :param name:
+
+    """
     if isinstance(maybe_obj, str):
         try:
             return registry[maybe_obj]
@@ -45,15 +50,16 @@ def _resolve_registry_or_callable(maybe_obj, registry, name: str):
             ) from e
     if callable(maybe_obj):
         return maybe_obj
-    raise TypeError(f"{name} must be a string key or a callable, got {type(maybe_obj).__name__}")
+    raise TypeError(
+        f"{name} must be a string key or a callable, got {type(maybe_obj).__name__}"
+    )
 
 
 def _resolve_loss(maybe_loss):
     """
-    Allow:
-      * 'mse' string (maps to local MSE),
-      * any callable (already constructed loss),
-    and reject unknown strings to avoid circular imports with package-level registries.
+
+    :param maybe_loss:
+
     """
     if isinstance(maybe_loss, str):
         if maybe_loss.lower() == "mse":
@@ -64,13 +70,16 @@ def _resolve_loss(maybe_loss):
         )
     if callable(maybe_loss):
         return maybe_loss
-    raise TypeError(f"loss_fn must be a string key or a callable, got {type(maybe_loss).__name__}")
-# ---------------------------------------------------------------------------
+    raise TypeError(
+        f"loss_fn must be a string key or a callable, got {type(maybe_loss).__name__}"
+    )
+
+
 def _resolve_regularizer(maybe_reg):
     """
-    Allow:
-      * string key -> lookup in REGULARIZERS
-      * callable -> pass through directly
+
+    :param maybe_reg:
+
     """
     if isinstance(maybe_reg, str):
         try:
@@ -82,7 +91,10 @@ def _resolve_regularizer(maybe_reg):
             ) from e
     if callable(maybe_reg):
         return maybe_reg
-    raise TypeError(f"model_regularizer must be a string key or a callable, got {type(maybe_reg).__name__}")
+    raise TypeError(
+        "model_regularizer must be a string key or a callable, got "
+        f"{type(maybe_reg).__name__}"
+    )
 
 
 class ContextualizedRegressionBase(pl.LightningModule):
@@ -126,7 +138,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
     #     self.base_y_predictor = base_y_predictor
     #     self.base_param_predictor = base_param_predictor
     #     self._build_metamodel(
-    #         context_dim, 
+    #         context_dim,
     #         x_dim,
     #         y_dim,
     #         univariate,
@@ -138,8 +150,8 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
     # @abstractmethod
     # def _build_metamodel(
-    #     self, 
-    #     context_dim, 
+    #     self,
+    #     context_dim,
     #     x_dim,
     #     y_dim,
     #     univariate,
@@ -156,7 +168,7 @@ class ContextualizedRegressionBase(pl.LightningModule):
     #     """
     #     # builds the metamodel
     #     self.metamodel = SINGLE_TASK_METAMODELS[self.metamodel_type](
-    #         context_dim, 
+    #         context_dim,
     #         x_dim,
     #         y_dim,
     #         univariate,
@@ -230,7 +242,9 @@ class ContextualizedRegressionBase(pl.LightningModule):
         if not self.fit_intercept:
             mu = torch.zeros_like(mu)
         if self.base_param_predictor is not None:
-            base_beta, base_mu = self.base_param_predictor.predict_params(batch["contexts"])
+            base_beta, base_mu = self.base_param_predictor.predict_params(
+                batch["contexts"]
+            )
             beta = beta + base_beta.to(beta.device)
             mu = mu + base_mu.to(mu.device)
         return beta, mu
@@ -243,27 +257,41 @@ class ContextualizedRegressionBase(pl.LightningModule):
         return optimizer
 
     def _batch_size_from_batch(self, batch: dict) -> int:
-        # all your datasets provide "contexts" in the batch dict
-        if isinstance(batch, dict) and "contexts" in batch and isinstance(batch["contexts"], torch.Tensor):
+        """
+
+        :param batch:
+
+        """
+        if (
+            isinstance(batch, dict)
+            and "contexts" in batch
+            and isinstance(batch["contexts"], torch.Tensor)
+        ):
             return int(batch["contexts"].shape[0])
         return 1
 
-
     def _predict_payload(self, batch: dict, **outputs) -> dict:
         """
-        Return a minimal, DDP-safe payload for trainer.predict:
-        - indices needed to reorder across ranks
-        - model outputs
-        Everything is detached and moved to CPU to avoid GPU memory blow-ups.
+
+        :param batch:
+        :param **outputs:
+
         """
         out = {}
-        for k in ("idx", "orig_idx", "sample_idx", "outcome_idx", "predictor_idx"):
+        for k in (
+            "idx",
+            "orig_idx",
+            "sample_idx",
+            "outcome_idx",
+            "predictor_idx",
+            "contexts",
+            "predictors",
+        ):
             if isinstance(batch, dict) and k in batch:
                 out[k] = batch[k]
 
         out.update(outputs)
 
-        # Detach + move tensors to CPU for cheap gather/reorder in wrapper code later
         for k, v in list(out.items()):
             if isinstance(v, torch.Tensor):
                 out[k] = v.detach().cpu()
@@ -271,10 +299,15 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
+        """
+
+        :param batch:
+        :param batch_idx:
+
+        """
         loss = self._batch_loss(batch, batch_idx)
         bs = self._batch_size_from_batch(batch)
 
-        # Step-level logging: keep visibility, avoid per-step all-reduce (DDP scaling killer)
         self.log(
             "train_loss_step",
             loss,
@@ -285,7 +318,6 @@ class ContextualizedRegressionBase(pl.LightningModule):
             batch_size=bs,
         )
 
-        # Epoch-level logging: sync across ranks once per epoch (correct global metric)
         self.log(
             "train_loss",
             loss,
@@ -298,9 +330,13 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
         return loss
 
-
-
     def validation_step(self, batch, batch_idx):
+        """
+
+        :param batch:
+        :param batch_idx:
+
+        """
         loss = self._batch_loss(batch, batch_idx)
         bs = self._batch_size_from_batch(batch)
         self.log(
@@ -314,8 +350,13 @@ class ContextualizedRegressionBase(pl.LightningModule):
         )
         return loss
 
-
     def test_step(self, batch, batch_idx):
+        """
+
+        :param batch:
+        :param batch_idx:
+
+        """
         loss = self._batch_loss(batch, batch_idx)
         bs = self._batch_size_from_batch(batch)
         self.log(
@@ -328,56 +369,58 @@ class ContextualizedRegressionBase(pl.LightningModule):
             batch_size=bs,
         )
         return loss
-    
+
     def _predict_from_models(self, X, beta_hat, mu_hat):
         """
-        Make shapes consistent before computing:
-            y = g( (beta ⊙ X).sum(-1, keepdim=True) + mu )
-        ...
-        """
 
-        # ---- Univariate grid case: X is (B, y_dim, x_dim, 1) ----
-        # singletask_univariate dataset convention produces predictors shaped (B, y, x, 1)
+        :param X:
+        :param beta_hat:
+        :param mu_hat:
+
+        """
         if isinstance(X, torch.Tensor) and X.dim() == 4 and X.shape[-1] == 1:
-            # move X to device/dtype
             X = X.to(device=beta_hat.device, dtype=beta_hat.dtype)
 
-            # beta_hat should be (B, y, x, 1) in this regime
             if beta_hat.dim() == 3:
                 beta_hat = beta_hat.unsqueeze(-1)
             if beta_hat.dim() != 4 or beta_hat.shape[-1] != 1:
-                raise RuntimeError(f"Univariate expects beta_hat (B,y,x,1); got {beta_hat.shape}")
+                raise RuntimeError(
+                    f"Univariate expects beta_hat (B,y,x,1); got {beta_hat.shape}"
+                )
 
-            # mu_hat should broadcast to (B, y, x, 1)
             if not isinstance(mu_hat, torch.Tensor):
-                mu_hat = torch.as_tensor(mu_hat, device=beta_hat.device, dtype=beta_hat.dtype)
+                mu_hat = torch.as_tensor(
+                    mu_hat, device=beta_hat.device, dtype=beta_hat.dtype
+                )
             else:
                 mu_hat = mu_hat.to(device=beta_hat.device, dtype=beta_hat.dtype)
 
             if mu_hat.dim() == 2:
-                # (B, y) -> (B, y, 1, 1) -> expand across x
-                mu_hat = mu_hat.unsqueeze(-1).unsqueeze(-1).expand(-1, beta_hat.shape[1], beta_hat.shape[2], 1)
+                mu_hat = (
+                    mu_hat.unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .expand(-1, beta_hat.shape[1], beta_hat.shape[2], 1)
+                )
             elif mu_hat.dim() == 3:
-                # (B, y, x) or (B, y, 1) -> (B, y, x, 1)
                 if mu_hat.shape[-1] == 1:
-                    mu_hat = mu_hat.unsqueeze(-1).expand(-1, beta_hat.shape[1], beta_hat.shape[2], 1)
+                    mu_hat = mu_hat.unsqueeze(-1).expand(
+                        -1, beta_hat.shape[1], beta_hat.shape[2], 1
+                    )
                 else:
                     mu_hat = mu_hat.unsqueeze(-1)
             elif mu_hat.dim() == 4 and mu_hat.shape[-1] == 1:
                 pass
             else:
-                raise RuntimeError(f"Unsupported mu_hat shape for univariate: {mu_hat.shape}")
+                raise RuntimeError(
+                    f"Unsupported mu_hat shape for univariate: {mu_hat.shape}"
+                )
 
             out = (beta_hat * X).sum(dim=-1, keepdim=True) + mu_hat
             return self.link_fn(out)
 
-        # ---- Normalize beta_hat to (B, y_dim, x_dim) ----
         if not isinstance(beta_hat, torch.Tensor):
-            raise RuntimeError(
-                f"beta_hat must be a tensor, got {type(beta_hat)}"
-            )
+            raise RuntimeError(f"beta_hat must be a tensor, got {type(beta_hat)}")
 
-        # Handle univariate case where shape is (B, y, x, 1)
         if beta_hat.dim() == 4 and beta_hat.shape[-1] == 1:
             beta_hat = beta_hat.squeeze(-1)
 
@@ -389,14 +432,12 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
         B, y_dim, x_dim = beta_hat.shape
 
-        # ---- Move and normalize X ----
         if not isinstance(X, torch.Tensor):
             X = torch.as_tensor(X, device=beta_hat.device, dtype=beta_hat.dtype)
         else:
             X = X.to(device=beta_hat.device, dtype=beta_hat.dtype)
 
         if X.dim() == 2:
-            # (B, x_dim) -> broadcast over y_dim
             if X.shape[0] != B:
                 raise RuntimeError(
                     f"X batch dim {X.shape[0]} != beta_hat batch dim {B}. "
@@ -417,11 +458,11 @@ class ContextualizedRegressionBase(pl.LightningModule):
                 )
 
             if X.shape[1] == y_dim and X.shape[2] == x_dim:
-                pass  # already good
+                pass
             elif X.shape[1] == 1 and X.shape[2] == x_dim:
-                X = X.expand(-1, y_dim, -1)  # (B,1,x) -> (B,y,x)
+                X = X.expand(-1, y_dim, -1)
             elif X.shape[1] == x_dim and X.shape[2] == y_dim and x_dim == y_dim:
-                X = X.permute(0, 2, 1)       # (B,x,y) -> (B,y,x)
+                X = X.permute(0, 2, 1)
             else:
                 raise RuntimeError(
                     f"Unexpected X shape {X.shape} for beta_hat {beta_hat.shape}. "
@@ -433,21 +474,17 @@ class ContextualizedRegressionBase(pl.LightningModule):
                 f"expected 2 or 3. X.shape={X.shape}, beta_hat.shape={beta_hat.shape}"
             )
 
-        # ---- Normalize mu_hat to broadcast correctly ----
         if not isinstance(mu_hat, torch.Tensor):
             mu_hat = torch.as_tensor(mu_hat, device=beta_hat.device, dtype=beta_hat.dtype)
         else:
             mu_hat = mu_hat.to(device=beta_hat.device, dtype=beta_hat.dtype)
 
-        # Handle univariate case where mu_hat is (B, y, x, 1)
         if mu_hat.dim() == 4 and mu_hat.shape[-1] == 1:
             mu_hat = mu_hat.squeeze(-1)
 
         if mu_hat.dim() == 2:
-            # (B, y_dim) -> (B, y_dim, 1)
             mu_hat = mu_hat.unsqueeze(-1)
         elif mu_hat.dim() == 3:
-            # assume already (B, y_dim, 1) or (B, y_dim, x_dim)
             pass
         else:
             raise RuntimeError(
@@ -457,10 +494,6 @@ class ContextualizedRegressionBase(pl.LightningModule):
 
         out = (beta_hat * X).sum(dim=-1, keepdim=True) + mu_hat
         return self.link_fn(out)
-
-
-
-
 
     def _predict_y(self, C, X, beta_hat, mu_hat):
         """
@@ -490,85 +523,6 @@ class ContextualizedRegressionBase(pl.LightningModule):
     #     kwargs["num_workers"] = kwargs.get("num_workers", 0)
     #     kwargs["batch_size"] = kwargs.get("batch_size", 32)
     #     return DataLoader(dataset=DataIterable(dataset_constructor(C, X, Y)), **kwargs)
-
-
-# class NaiveContextualizedRegression(ContextualizedRegressionBase):
-#     """See NaiveMetamodel"""
-
-#     def _build_metamodel(self, *args, **kwargs):
-#         """
-
-#         :param *args:
-#         :param **kwargs:
-
-#         """
-#         kwargs["univariate"] = False
-#         self.metamodel = NaiveMetamodel(*args, **kwargs)
-
-#     def _batch_loss(self, batch, batch_idx):
-#         """
-
-#         :param batch:
-#         :param batch_idx:
-
-#         """
-#         C, X, Y, _ = batch
-#         beta_hat, mu_hat = self.predict_step(batch, batch_idx)
-#         pred_loss = self.loss_fn(Y, self._predict_y(C, X, beta_hat, mu_hat))
-#         reg_loss = self.model_regularizer(beta_hat, mu_hat)
-#         return pred_loss + reg_loss
-
-#     def predict_step(self, batch, batch_idx):
-#         """
-
-#         :param batch:
-#         :param batch_idx:
-
-#         """
-#         C, _, _, _ = batch
-#         beta_hat, mu_hat = self(C)
-#         return beta_hat, mu_hat
-
-    # def _params_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     betas = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     mus = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         _, _, _, n_idx = data
-    #         betas[n_idx] = beta_hats
-    #         mus[n_idx] = mu_hats.squeeze(-1)
-    #     return betas, mus
-
-    # def _y_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     ys = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         C, X, _, n_idx = data
-    #         ys[n_idx] = self._predict_y(C, X, beta_hats, mu_hats).squeeze(-1)
-    #     return ys
-
-    # def dataloader(self, C, X, Y, **kwargs):
-    #     """
-
-    #     :param C:
-    #     :param X:
-    #     :param Y:
-    #     :param **kwargs:
-
-    #     """
-    #     return self._dataloader(C, X, Y, MultivariateDataset, **kwargs)
 
 
 class ContextualizedRegression(ContextualizedRegressionBase):
@@ -608,7 +562,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         self.base_param_predictor = base_param_predictor
         if metamodel_type == "subtype":
             self.metamodel = SubtypeMetamodel(
-                context_dim=context_dim, 
+                context_dim=context_dim,
                 x_dim=x_dim,
                 y_dim=y_dim,
                 univariate=False,
@@ -620,7 +574,7 @@ class ContextualizedRegression(ContextualizedRegressionBase):
             if num_archetypes is not None:
                 raise ValueError("NaiveMetamodel does not support num_archetypes.")
             self.metamodel = NaiveMetamodel(
-                context_dim=context_dim, 
+                context_dim=context_dim,
                 x_dim=x_dim,
                 y_dim=y_dim,
                 univariate=False,
@@ -638,7 +592,10 @@ class ContextualizedRegression(ContextualizedRegressionBase):
 
         """
         beta_hat, mu_hat = self(batch)
-        pred_loss = self.loss_fn(batch["outcomes"], self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat))
+        pred_loss = self.loss_fn(
+            batch["outcomes"],
+            self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat),
+        )
         reg_loss = self.model_regularizer(beta_hat, mu_hat)
         return pred_loss + reg_loss
 
@@ -648,51 +605,9 @@ class ContextualizedRegression(ContextualizedRegressionBase):
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
 
 
-    # def _params_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     betas = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     mus = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         _, _, _, n_idx = data
-    #         betas[n_idx] = beta_hats
-    #         mus[n_idx] = mu_hats.squeeze(-1)
-    #     return betas, mus
-
-    # def _y_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     ys = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         C, X, _, n_idx = data
-    #         ys[n_idx] = self._predict_y(C, X, beta_hats, mu_hats).squeeze(-1)
-    #     return ys
-
-    # def dataloader(self, C, X, Y, **kwargs):
-    #     """
-
-    #     :param C:
-    #     :param X:
-    #     :param Y:
-    #     :param **kwargs:
-
-    #     """
-    #     return self._dataloader(C, X, Y, MultivariateDataset, **kwargs)
-
-
 class NaiveContextualizedRegression(ContextualizedRegression):
     """Handle for NaiveMetamodel usage of ContextualizedRegression.
-    Does not use archetypes. 
+    Does not use archetypes.
     """
     def __init__(
         self,
@@ -727,10 +642,9 @@ class NaiveContextualizedRegression(ContextualizedRegression):
             loss_fn=loss_fn,
             model_regularizer=model_regularizer,
             base_y_predictor=base_y_predictor,
-            base_param_predictor=base_param_predictor
+            base_param_predictor=base_param_predictor,
         )
         self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
-
 
 
 class MultitaskContextualizedRegression(ContextualizedRegressionBase):
@@ -782,7 +696,6 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
         beta, mu = self.metamodel(batch["contexts"], batch["task"])
         if not self.fit_intercept:
             mu = torch.zeros_like(mu)
-        # Does not support base_param_predictor
         return beta, mu
 
     def _batch_loss(self, batch, batch_idx):
@@ -793,10 +706,13 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
 
         """
         beta_hat, mu_hat = self(batch)
-        pred_loss = self.loss_fn(batch['outcomes'], self._predict_y(batch['contexts'], batch['predictors'], beta_hat, mu_hat))
+        pred_loss = self.loss_fn(
+            batch["outcomes"],
+            self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat),
+        )
         reg_loss = self.model_regularizer(beta_hat, mu_hat)
         return pred_loss + reg_loss
-    
+
     def _predict_y(self, C, X, beta_hat, mu_hat):
         """
 
@@ -807,57 +723,12 @@ class MultitaskContextualizedRegression(ContextualizedRegressionBase):
 
         """
         Y = self._predict_from_models(X, beta_hat, mu_hat)
-        # Does not support base_y_predictor
         return Y
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-
-
-
-
-    # def _params_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     betas = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     mus = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         _, _, _, _, n_idx, y_idx = data
-    #         betas[n_idx, y_idx] = beta_hats
-    #         mus[n_idx, y_idx] = mu_hats.squeeze(-1)
-    #     return betas, mus
-
-    # def _y_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     ys = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         C, _, X, _, n_idx, y_idx = data
-    #         ys[n_idx, y_idx] = self._predict_y(C, X, beta_hats, mu_hats).squeeze(-1)
-    #     return ys
-
-    # def dataloader(self, C, X, Y, **kwargs):
-    #     """
-
-    #     :param C:
-    #     :param X:
-    #     :param Y:
-    #     :param **kwargs:
-
-    #     """
-    #     return self._dataloader(C, X, Y, MultitaskMultivariateDataset, **kwargs)
 
 
 class TasksplitContextualizedRegression(ContextualizedRegressionBase):
@@ -912,7 +783,7 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
             task_encoder_type=task_encoder_type,
             task_encoder_kwargs=task_encoder_kwargs,
         )
-    
+
     def forward(self, batch):
         """
 
@@ -922,7 +793,6 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
         beta, mu = self.metamodel(batch["contexts"], batch["task"])
         if not self.fit_intercept:
             mu = torch.zeros_like(mu)
-        # Does not support base_param_predictor
         return beta, mu
 
     def _batch_loss(self, batch, batch_idx):
@@ -933,10 +803,13 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
 
         """
         beta_hat, mu_hat = self(batch)
-        pred_loss = self.loss_fn(batch['outcomes'], self._predict_y(batch['contexts'], batch['predictors'], beta_hat, mu_hat))
+        pred_loss = self.loss_fn(
+            batch["outcomes"],
+            self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat),
+        )
         reg_loss = self.model_regularizer(beta_hat, mu_hat)
         return pred_loss + reg_loss
-    
+
     def _predict_y(self, C, X, beta_hat, mu_hat):
         """
 
@@ -947,82 +820,12 @@ class TasksplitContextualizedRegression(ContextualizedRegressionBase):
 
         """
         Y = self._predict_from_models(X, beta_hat, mu_hat)
-        # Does not support base_y_predictor
         return Y
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-
-
-
-    # def _batch_loss(self, batch, batch_idx):
-    #     """
-
-    #     :param batch:
-    #     :param batch_idx:
-
-    #     """
-    #     beta_hat, mu_hat = self(batch)
-    #     pred_loss = self.loss_fn(batch["outcomes"], self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat))
-    #     reg_loss = self.model_regularizer(beta_hat, mu_hat)
-    #     return pred_loss + reg_loss
-
-    # def predict_step(self, batch, batch_idx):
-    #     """
-
-    #     :param batch:
-    #     :param batch_idx:
-
-    #     """
-    #     beta_hat, mu_hat = self(batch)
-    #     batch.update({
-    #         "betas": beta_hat,
-    #         "mus": mu_hat.squeeze(-1)
-    #     })
-    #     return batch
-
-    # def _params_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     betas = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     mus = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         _, _, _, _, n_idx, y_idx = data
-    #         betas[n_idx, y_idx] = beta_hats
-    #         mus[n_idx, y_idx] = mu_hats.squeeze(-1)
-    #     return betas, mus
-
-    # def _y_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     ys = np.zeros((ds.n, ds.y_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         C, _, X, _, n_idx, y_idx = data
-    #         ys[n_idx, y_idx] = self._predict_y(C, X, beta_hats, mu_hats).squeeze(-1)
-    #     return ys
-
-    # def dataloader(self, C, X, Y, **kwargs):
-    #     """
-
-    #     :param C:
-    #     :param X:
-    #     :param Y:
-    #     :param **kwargs:
-
-    #     """
-    #     return self._dataloader(C, X, Y, MultitaskMultivariateDataset, **kwargs)
 
 
 class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
@@ -1062,7 +865,7 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         self.base_param_predictor = base_param_predictor
         if metamodel_type == "subtype":
             self.metamodel = SubtypeMetamodel(
-                context_dim=context_dim, 
+                context_dim=context_dim,
                 x_dim=x_dim,
                 y_dim=y_dim,
                 univariate=True,
@@ -1074,7 +877,7 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
             if num_archetypes is not None:
                 raise ValueError("NaiveMetamodel does not support num_archetypes.")
             self.metamodel = NaiveMetamodel(
-                context_dim=context_dim, 
+                context_dim=context_dim,
                 x_dim=x_dim,
                 y_dim=y_dim,
                 univariate=True,
@@ -1083,7 +886,7 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
             )
         else:
             raise ValueError("Supported metamodel_type's: subtype, naive")
-    
+
     def forward(self, batch):
         """
 
@@ -1093,9 +896,8 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         beta, mu = self.metamodel(batch["contexts"])
         if not self.fit_intercept:
             mu = torch.zeros_like(mu)
-        # Does not support base_param_predictor
         return beta, mu
-    
+
     def _batch_loss(self, batch, batch_idx):
         """
 
@@ -1104,7 +906,10 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
         """
         beta_hat, mu_hat = self(batch)
-        pred_loss = self.loss_fn(batch["outcomes"], self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat))
+        pred_loss = self.loss_fn(
+            batch["outcomes"],
+            self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat),
+        )
         reg_loss = self.model_regularizer(beta_hat, mu_hat)
         return pred_loss + reg_loss
 
@@ -1112,48 +917,6 @@ class ContextualizedUnivariateRegression(ContextualizedRegressionBase):
         beta_hat, mu_hat = self(batch)
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-
-
-    # def _params_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     betas = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     mus = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         _, _, _, n_idx = data
-    #         betas[n_idx] = beta_hats.squeeze(-1)
-    #         mus[n_idx] = mu_hats.squeeze(-1)
-    #     return betas, mus
-
-    # def _y_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     ys = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         C, X, _, n_idx = data
-    #         ys[n_idx] = self._predict_y(C, X, beta_hats, mu_hats).squeeze(-1)
-    #     return ys
-
-    # def dataloader(self, C, X, Y, **kwargs):
-    #     """
-
-    #     :param C:
-    #     :param X:
-    #     :param Y:
-    #     :param **kwargs:
-
-    #     """
-    #     return self._dataloader(C, X, Y, UnivariateDataset, **kwargs)
 
 
 class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
@@ -1196,7 +959,7 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
             encoder_type=encoder_type,
             encoder_kwargs=encoder_kwargs,
         )
-    
+
     def forward(self, batch):
         """
 
@@ -1206,7 +969,6 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
         beta, mu = self.metamodel(batch["contexts"], batch["task"])
         if not self.fit_intercept:
             mu = torch.zeros_like(mu)
-        # Does not support base_param_predictor
         return beta, mu
 
     def _batch_loss(self, batch, batch_idx):
@@ -1217,10 +979,13 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
         """
         beta_hat, mu_hat = self(batch)
-        pred_loss = self.loss_fn(batch['outcomes'], self._predict_y(batch['contexts'], batch['predictors'], beta_hat, mu_hat))
+        pred_loss = self.loss_fn(
+            batch["outcomes"],
+            self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat),
+        )
         reg_loss = self.model_regularizer(beta_hat, mu_hat)
         return pred_loss + reg_loss
-    
+
     def _predict_y(self, C, X, beta_hat, mu_hat):
         """
 
@@ -1231,14 +996,12 @@ class MultitaskContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
         """
         Y = self._predict_from_models(X, beta_hat, mu_hat)
-        # Does not support base_y_predictor
         return Y
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-
 
 
 class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
@@ -1291,7 +1054,7 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
             task_encoder_type=task_encoder_type,
             task_encoder_kwargs=task_encoder_kwargs,
         )
-    
+
     def forward(self, batch):
         """
 
@@ -1301,7 +1064,6 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
         beta, mu = self.metamodel(batch["contexts"], batch["task"])
         if not self.fit_intercept:
             mu = torch.zeros_like(mu)
-        # Does not support base_param_predictor
         return beta, mu
 
     def _batch_loss(self, batch, batch_idx):
@@ -1312,10 +1074,13 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
         """
         beta_hat, mu_hat = self(batch)
-        pred_loss = self.loss_fn(batch['outcomes'], self._predict_y(batch['contexts'], batch['predictors'], beta_hat, mu_hat))
+        pred_loss = self.loss_fn(
+            batch["outcomes"],
+            self._predict_y(batch["contexts"], batch["predictors"], beta_hat, mu_hat),
+        )
         reg_loss = self.model_regularizer(beta_hat, mu_hat)
         return pred_loss + reg_loss
-    
+
     def _predict_y(self, C, X, beta_hat, mu_hat):
         """
 
@@ -1326,58 +1091,12 @@ class TasksplitContextualizedUnivariateRegression(ContextualizedRegressionBase):
 
         """
         Y = self._predict_from_models(X, beta_hat, mu_hat)
-        # Does not support base_y_predictor
         return Y
 
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-
-
-
-    # def _params_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     betas = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     mus = betas.copy()
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         _, _, _, _, n_idx, x_idx, y_idx = data
-    #         betas[n_idx, y_idx, x_idx] = beta_hats.squeeze(-1)
-    #         mus[n_idx, y_idx, x_idx] = mu_hats.squeeze(-1)
-    #     return betas, mus
-
-    # def _y_reshape(self, preds, dataloader):
-    #     """
-
-    #     :param preds:
-    #     :param dataloader:
-
-    #     """
-    #     ds = dataloader.dataset.dataset
-    #     ys = np.zeros((ds.n, ds.y_dim, ds.x_dim))
-    #     for (beta_hats, mu_hats), data in zip(preds, dataloader):
-    #         C, _, X, _, n_idx, x_idx, y_idx = data
-    #         ys[n_idx, y_idx, x_idx] = self._predict_y(C, X, beta_hats, mu_hats).squeeze(
-    #             -1
-    #         )
-    #     return ys
-
-    # def dataloader(self, C, X, Y, **kwargs):
-    #     """
-
-    #     :param C:
-    #     :param X:
-    #     :param Y:
-    #     :param **kwargs:
-
-    #     """
-    #     return self._dataloader(C, X, Y, MultitaskUnivariateDataset, **kwargs)
 
 
 class ContextualizedCorrelation(ContextualizedUnivariateRegression):
@@ -1393,10 +1112,9 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
         self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
 
-
     def predict_step(self, batch, batch_idx):
         beta_hat, mu_hat = self(batch)
-        beta_hat = beta_hat.squeeze(-1)  # (B, y, x)
+        beta_hat = beta_hat.squeeze(-1)
 
         beta_hat_T = beta_hat.transpose(1, 2)
         signs = torch.sign(beta_hat)
@@ -1404,10 +1122,9 @@ class ContextualizedCorrelation(ContextualizedUnivariateRegression):
         correlations = signs * torch.sqrt(torch.abs(beta_hat * beta_hat_T))
 
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
-        return self._predict_payload(batch, betas=beta_hat, mus=mu_hat, correlations=correlations)
-
-
-
+        return self._predict_payload(
+            batch, betas=beta_hat, mus=mu_hat, correlations=correlations
+        )
 
 
 class MultitaskContextualizedCorrelation(MultitaskContextualizedUnivariateRegression):
@@ -1424,7 +1141,6 @@ class MultitaskContextualizedCorrelation(MultitaskContextualizedUnivariateRegres
         self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
 
 
-
 class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegression):
     """Using multitask univariate contextualized regression to estimate Pearson's correlation
     See TasksplitMetamodel for assumptions and full docstring
@@ -1437,7 +1153,6 @@ class TasksplitContextualizedCorrelation(TasksplitContextualizedUnivariateRegres
             del kwargs["y_dim"]
         super().__init__(context_dim, x_dim, x_dim, **kwargs)
         self.save_hyperparameters(ignore=["base_y_predictor", "base_param_predictor"])
-
 
 
 class ContextualizedNeighborhoodSelection(ContextualizedRegression):
@@ -1465,14 +1180,11 @@ class ContextualizedNeighborhoodSelection(ContextualizedRegression):
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
-        beta_hat, mu_hat = self(batch)  # dict batch
+        beta_hat, mu_hat = self(batch)
         beta_hat = beta_hat * self.diag_mask.expand(beta_hat.shape[0], -1, -1)
 
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-
-
-
 
 
 class ContextualizedMarkovGraph(ContextualizedRegression):
@@ -1492,10 +1204,9 @@ class ContextualizedMarkovGraph(ContextualizedRegression):
         self.register_buffer("diag_mask", torch.ones(x_dim, x_dim) - torch.eye(x_dim))
 
     def predict_step(self, batch, batch_idx):
-        beta_hat, mu_hat = self(batch)  # dict batch
+        beta_hat, mu_hat = self(batch)
         beta_hat = beta_hat + beta_hat.transpose(1, 2)
         beta_hat = beta_hat * self.diag_mask.expand(beta_hat.shape[0], -1, -1)
 
         mu_hat = mu_hat if mu_hat.dim() >= 3 else mu_hat.unsqueeze(-1)
         return self._predict_payload(batch, betas=beta_hat, mus=mu_hat)
-

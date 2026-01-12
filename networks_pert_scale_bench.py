@@ -1,35 +1,5 @@
 #!/usr/bin/env python3
-"""
-Baseline scaling benchmark for unseen_pert with true 1-GPU vs 2-GPU comparison (DDP).
-
-- Preprocesses L1000 + controls, building C (context) and X (features)
-- Trains a simple MLP regressor C -> X
-
-It runs two modes in ONE command:
-  1) 1 GPU  -> single-process training on cuda:0
-  2) 2 GPUs -> DistributedDataParallel (DDP) with 2 processes (ranks 0 and 1),
-               each bound to one GPU.
-D
-For each mode it prints:
-  - wall time (seconds)
-  - throughput (samples / second)
-  - final train MSE
-  - final test MSE
-
-Outputs:
-  - CSV: bench_out_unseen/scale_results_unseen_ddp.csv (two rows: 1gpu, 2gpu)
-
-Typical usage inside a 2-GPU interactive job:
-
-  cd /fs/scratch/PAS2942/samuel_wales_mcgrath/hpc/Contextualized
-  conda activate contextpert-hpc
-
-  python unseen_pert_scale_ddp.py \
-    --epochs 20 \
-    --batch-size 512 \
-    --num-workers 0 \
-    --subsample-fraction 1.0
-"""
+# Benchmark script that preprocesses unseen_pert data and compares 1-GPU training vs 2-GPU DDP training for a simple MLP regressor.
 
 import os
 import time
@@ -56,8 +26,7 @@ from rdkit import Chem
 from rdkit.Chem import rdFingerprintGenerator
 
 
-# ------------------- paths & basic config -------------------
-
+# Paths and basic config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
 
@@ -71,15 +40,12 @@ RANDOM_STATE = 42
 morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=3, fpSize=4096)
 
 
-# ------------------- env + seeds -------------------
-
+# Environment and RNG seeding
 def set_env_defaults():
-    """Safe CPU/GPU threading + seeds (for non-DDP parts)."""
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # Do NOT clear MASTER_ADDR/MASTER_PORT here; DDP will need them later.
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -92,17 +58,14 @@ def set_env_defaults():
 
 
 def set_seeds(rank: int):
-    """Per-process seeds for DDP workers."""
     np.random.seed(RANDOM_STATE + rank)
     torch.manual_seed(RANDOM_STATE + rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_STATE + rank)
 
 
-# ------------------- fingerprint helper -------------------
-
+# Fingerprint helper
 def smiles_to_morgan_fp(smiles: str) -> np.ndarray:
-    """Convert a SMILES string to a Morgan fingerprint (binary vector)."""
     try:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
@@ -116,26 +79,15 @@ def smiles_to_morgan_fp(smiles: str) -> np.ndarray:
         return np.zeros(morgan_gen.GetOptions().fpSize, dtype=np.float32)
 
 
-# ------------------- data preprocessing (unseen_pert) -------------------
-
+# Data preprocessing for unseen_pert
 def load_and_preprocess(
     subsample_fraction: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Implements the unseen_pert preprocessing, returning:
-      C_train, X_train_norm, C_test, X_test_norm, cell_ids_train, cell_ids_test
-
-    where:
-      - X_*_norm are PCA+standardized gene features
-      - C_* are context vectors (ctrl PCs + Morgan + time/dose flags)
-    """
     print(f"Reading L1000 data from {PATH_L1000}")
     df = pd.read_csv(PATH_L1000, engine="pyarrow")
 
-    # Only trt_cp perturbations
     df = df[df["pert_type"].isin(["trt_cp"])]
 
-    # Quality filters
     bad = (
         (df["distil_cc_q75"] < 0.2)
         | (df["distil_cc_q75"] == -666)
@@ -146,7 +98,6 @@ def load_and_preprocess(
     )
     df = df[~bad]
 
-    # Valid SMILES only
     df = df.dropna(subset=["canonical_smiles"])
     df = df[df["canonical_smiles"] != ""]
 
@@ -156,7 +107,6 @@ def load_and_preprocess(
         df = df.sample(frac=subsample_fraction, random_state=RANDOM_STATE)
         print(f"Subsampled to {len(df)} samples ({subsample_fraction * 100:.1f}% of data)")
 
-    # Perturbation holdout: split on unique SMILES
     unique_smiles = df["canonical_smiles"].unique()
     print(f"Found {len(unique_smiles)} unique perturbations (SMILES)")
     smiles_train, smiles_test = train_test_split(
@@ -171,7 +121,6 @@ def load_and_preprocess(
     print(f"Perturbation split: {len(smiles_train)} train, {len(smiles_test)} test perturbations")
     print(f"Sample split: {len(df_train)} train, {len(df_test)} test samples")
 
-    # Handle pert_time / pert_dose missing values with -666 logic
     pert_time_mean = None
     pert_dose_mean = None
 
@@ -221,17 +170,14 @@ def load_and_preprocess(
         df_test, "test"
     )
 
-    # Scale gene expression
     print("Scaling gene expression...")
     scaler_genes = StandardScaler()
     X_train_scaled = scaler_genes.fit_transform(X_raw_train)
     X_test_scaled = scaler_genes.transform(X_raw_test)
 
-    # Morgan fingerprints as float (already binary)
     morgan_train_scaled = morgan_train.astype(np.float32)
     morgan_test_scaled = morgan_test.astype(np.float32)
 
-    # Load controls
     print(f"Reading control profiles from {PATH_CTLS}")
     ctrls_df = pd.read_csv(PATH_CTLS, index_col=0)
 
@@ -356,7 +302,6 @@ def load_and_preprocess(
     print(f"C_train: {C_train.shape}, X_train: {X_train.shape}")
     print(f"C_test:  {C_test.shape}, X_test:  {X_test.shape}")
 
-    # PCA on X then scale
     print("PCA + scaling on gene features...")
     pca_data = PCA(n_components=N_DATA_PCS, random_state=RANDOM_STATE)
     X_train_pca = pca_data.fit_transform(X_train)
@@ -369,7 +314,6 @@ def load_and_preprocess(
     print(f"Final X_train_norm: {X_train_norm.shape}, X_test_norm: {X_test_norm.shape}")
 
     return C_train, X_train_norm, C_test, X_test_norm, cell_ids_train, cell_ids_test
-
 
 
 @dataclass
@@ -404,7 +348,6 @@ def run_single_gpu(
     num_workers: int,
     subsample_fraction: Optional[float],
 ) -> BenchResult:
-    """Single-process, single-GPU training on cuda:0 (or CPU)."""
     label = "1gpu_single"
     print("\n================ 1-GPU baseline (single process) ================")
 
@@ -481,7 +424,6 @@ def run_single_gpu(
     samples_total = n_samples * epochs
     throughput = samples_total / max(wall, 1e-9)
 
-    # Evaluation
     def eval_mse(loader, split_name: str) -> float:
         model.eval()
         total_loss = 0.0
@@ -529,13 +471,8 @@ def ddp_worker(
     subsample_fraction: Optional[float],
     result_dict,
 ):
-    """
-    DDP worker function run by each spawned process (rank 0 and 1).
-    We only record metrics in rank 0 and put them in result_dict["2gpu_ddp"].
-    """
     set_seeds(rank)
 
-    # Device mapping: assume 2 GPUs visible, use local index = rank
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
@@ -557,7 +494,6 @@ def ddp_worker(
         if torch.cuda.is_available():
             print(f"[{label}] Using GPUs 0 and 1 with DDP")
 
-    # IMPORTANT: we measure only training time; data loading can be duplicated.
     C_train, X_train_norm, C_test, X_test_norm, _, _ = load_and_preprocess(
         subsample_fraction=subsample_fraction
     )
@@ -586,7 +522,6 @@ def ddp_worker(
         pin_memory=torch.cuda.is_available(),
     )
 
-    # test_loader will only be used on rank 0 after training (non-distributed).
     in_dim = C_train.shape[1]
     out_dim = X_train_norm.shape[1]
 
@@ -603,13 +538,11 @@ def ddp_worker(
 
     n_samples = C_train.shape[0]
 
-    # Synchronize before timing
     dist.barrier()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     t0 = time.time()
 
-    # Training loop
     for epoch in range(epochs):
         ddp_model.train()
         train_sampler.set_epoch(epoch)
@@ -631,7 +564,6 @@ def ddp_worker(
             running_loss += loss.item() * bsz
             count_seen += bsz
 
-        # Aggregate epoch loss to rank 0 (average over all samples)
         loss_tensor = torch.tensor([running_loss, count_seen], dtype=torch.float64, device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         if rank == 0:
@@ -639,15 +571,12 @@ def ddp_worker(
             epoch_loss = total_loss / max(total_count, 1.0)
             print(f"[{label}] Epoch {epoch+1}/{epochs} - train MSE {epoch_loss:.6f}")
 
-    # Synchronize end of training
     dist.barrier()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     wall = time.time() - t0
 
-    # Only rank 0 computes evaluation, using full dataset on its GPU
     if rank == 0:
-        # For evaluation we use the underlying model (not wrapped in DDP)
         eval_model = ddp_model.module
         eval_model.eval()
 
@@ -704,12 +633,10 @@ def ddp_worker(
             test_mse_mean=test_mse,
         )
 
-    # Tear down process group
     dist.destroy_process_group()
 
 
-# ------------------- CSV writer -------------------
-
+# CSV writer
 def save_results_csv(results: List[BenchResult], outdir: str):
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, "scale_results_unseen_ddp.csv")
@@ -739,8 +666,7 @@ def save_results_csv(results: List[BenchResult], outdir: str):
     print(f"\nSaved CSV → {path}")
 
 
-# ------------------- CLI & main -------------------
-
+# CLI and main
 def parse_args():
     import argparse
 
@@ -780,7 +706,6 @@ def main():
 
     results: List[BenchResult] = []
 
-    # 1-GPU baseline
     res_1gpu = run_single_gpu(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -789,10 +714,9 @@ def main():
     )
     results.append(res_1gpu)
 
-    # 2-GPU DDP baseline
     if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
         world_size = 2
-        port = args.ddp_port  # use TCP init on localhost
+        port = args.ddp_port
 
         manager = mp.Manager()
         result_dict = manager.dict()

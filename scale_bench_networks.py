@@ -1,82 +1,5 @@
 #!/usr/bin/env python3
-"""
-scale_bench_networks.py
-
-A torchrun-friendly DDP scaling benchmark for Contextualized *Networks* lightning modules
-(e.g., ContextualizedCorrelation, ContextualizedMarkovGraph, NOTMAD).
-
-Design goals (to reveal true scaling):
-  - Fixed number of optimizer steps (not epochs) so each run does identical work.
-  - Optional GPU-resident synthetic dataset to remove CPU dataloading/transfer bottlenecks.
-  - Measures only the *steady-state* region (warmup steps excluded).
-  - Uses Lightning DDP under torchrun correctly (devices=1 per process).
-  - No validation, no logging, no checkpoints.
-
-------------------------------------------------------------
-Quick start (single node, 1..4 GPUs)
-------------------------------------------------------------
-
-# 0) NICs (optional)
-ls -1 /sys/class/net
-ip -o link show | awk -F': ' '{print NR-1": "$2}'
-
-# 1) Minimal, safe NCCL/torch env (no hard-coded eth0):
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export TOKENIZERS_PARALLELISM=false
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG=WARN
-export NCCL_P2P_DISABLE=0
-export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=$(ls /sys/class/net | grep -E '^(ens|enp|eno|eth|bond|ib)' | head -n1)
-[ -z "$NCCL_SOCKET_IFNAME" ] && export NCCL_SOCKET_IFNAME="^lo,docker0"
-
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# 2) Kill any stragglers (optional)
-pkill -f scale_bench_networks.py || true
-pkill -f torchrun || true
-
-# 3) Runs (IMPORTANT: --batch-size is PER GPU)
-
-# Correlation networks
-torchrun --standalone --nproc_per_node=1 scale_bench_networks.py \
-  --network correlation \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 2048 --precision bf16 \
-  --context-dim 16 --x-dim 512 \
-  --encoder-type mlp --width 1024 --layers 4 \
-  --num-archetypes 8 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/corr_gpu1
-
-torchrun --standalone --nproc_per_node=2 scale_bench_networks.py \
-  --network correlation \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 2048 --precision bf16 \
-  --context-dim 16 --x-dim 512 \
-  --encoder-type mlp --width 1024 --layers 4 \
-  --num-archetypes 8 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/corr_gpu2
-
-# Markov networks (precision matrices)
-torchrun --standalone --nproc_per_node=4 scale_bench_networks.py \
-  --network markov \
-  --steps 400 --warmup-steps 50 \
-  --batch-size 1024 --precision bf16 \
-  --context-dim 16 --x-dim 256 \
-  --encoder-type mlp --width 512 --layers 3 \
-  --num-archetypes 8 \
-  --buffer-batches 32 --data-device auto \
-  --outdir bench_out/markov_gpu4
-
-Notes:
-  - If scaling is poor with --data-device=cuda (or auto on GPU), the bottleneck is
-    likely *real* (NCCL/topology/comm, too-small batch, CPU freq limits, etc.).
-  - Multi-node: remove --standalone and use --nnodes/--node_rank with a shared rdzv endpoint.
-"""
+# Torchrun-friendly DDP scaling benchmark for Contextualized network LightningModules using synthetic buffered data.
 
 import os
 import time
@@ -93,7 +16,6 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback
 from pytorch_lightning.strategies import DDPStrategy
 
-# ---- your package pieces ----
 from contextualized.regression.datamodules import ContextualizedRegressionDataModule
 from contextualized.regression.lightning_modules import (
     ContextualizedCorrelation,
@@ -102,7 +24,7 @@ from contextualized.regression.lightning_modules import (
 from contextualized.dags.lightning_modules import NOTMAD
 
 
-# ---------------- launcher/cluster helpers ----------------
+# Launcher/cluster helpers
 def under_torchrun() -> bool:
     e = os.environ
     return ("LOCAL_RANK" in e) or ("RANK" in e) or ("WORLD_SIZE" in e)
@@ -133,7 +55,7 @@ def is_global_zero() -> bool:
     return global_rank() == 0
 
 
-# ---------------- env + perf ----------------
+# Environment defaults and GPU performance flags
 def set_env_defaults():
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -156,7 +78,7 @@ def set_env_defaults():
         except Exception:
             os.environ["NCCL_SOCKET_IFNAME"] = "^lo,docker0"
 
-    # TF32 / matmul speedups (safe for throughput benchmarking)
+    # TF32 / matmul speedups for throughput benchmarking
     if torch.cuda.is_available():
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -206,15 +128,8 @@ def map_precision(p: str):
     return 32
 
 
-# ---------------- timing ----------------
+# Timing callback for steady-state step timing
 class SteadyStateStepTimer(Callback):
-    """
-    Times optimizer steps in a steady-state window:
-      - ignore first warmup_steps
-      - measure next measure_steps
-    Assumes accumulate_grad_batches == 1.
-    """
-
     def __init__(self, warmup_steps: int, measure_steps: int):
         super().__init__()
         self.warmup_steps = int(warmup_steps)
@@ -247,9 +162,7 @@ class SteadyStateStepTimer(Callback):
 
 
 def dist_max(value: float) -> float:
-    """
-    Returns max(value across ranks) if distributed is initialized; else returns value.
-    """
+    # Return max(value across ranks) if distributed is initialized
     try:
         import torch.distributed as dist
 
@@ -264,7 +177,7 @@ def dist_max(value: float) -> float:
     return float(value)
 
 
-# ---------------- synthetic data ----------------
+# Synthetic buffer construction
 def make_synthetic_tensors(
     n: int,
     c_dim: int,
@@ -272,14 +185,8 @@ def make_synthetic_tensors(
     device: torch.device,
     seed: int,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Builds a fixed synthetic buffer (not timed). Shapes:
-      C: (n, c_dim)
-      X: (n, x_dim)
-      Y: (n, x_dim)   # for networks we follow the wrapper convention (univariate task uses y_dim=x_dim)
-    """
+    # Build a fixed synthetic buffer with per-rank seeding
     g = torch.Generator(device=device)
-    # Per-rank seed to avoid identical data, while keeping identical shapes across ranks.
     g.manual_seed(int(seed) + 1000 * global_rank())
 
     C = torch.randn((n, c_dim), generator=g, device=device, dtype=torch.float32)
@@ -288,14 +195,9 @@ def make_synthetic_tensors(
     return {"C": C, "X": X, "Y": Y}
 
 
-# ---------------- model/datamodule/trainer ----------------
+# Model/datamodule/trainer builders
 def build_model(args):
-    """
-    Robustly instantiate the selected network LightningModule.
-
-    We pass a *superset* of kwargs and filter by the model's __init__ signature to
-    remain compatible with small constructor differences across implementations.
-    """
+    # Instantiate the selected network LightningModule with signature-filtered kwargs
     import inspect
 
     if args.network == "correlation":
@@ -309,11 +211,10 @@ def build_model(args):
 
     encoder_kwargs = {"width": args.width, "layers": args.layers, "link_fn": "identity"}
 
-    # Common superset
     kw = dict(
         context_dim=args.context_dim,
         x_dim=args.x_dim,
-        y_dim=args.x_dim,  # networks wrapper convention
+        y_dim=args.x_dim,
         univariate=True,
         num_archetypes=args.num_archetypes,
         encoder_type=args.encoder_type,
@@ -325,7 +226,6 @@ def build_model(args):
         model_regularizer="none",
     )
 
-    # NOTMAD-specific defaults (safe baseline; tune as needed)
     if args.network == "bayesian":
         kw.update(
             archetype_loss_params=dict(
@@ -354,7 +254,6 @@ def build_model(args):
         return model_cls(**kw)
 
     filtered = {k: v for k, v in kw.items() if k in sig.parameters}
-    # Basic required-arg check (only for explicit signatures)
     required = [
         name
         for name, p in sig.parameters.items()
@@ -373,10 +272,7 @@ def build_model(args):
 
 
 def build_dm(args, C, X, Y) -> ContextualizedRegressionDataModule:
-    """
-    Uses the same DataModule family as the wrapper (consistent batch structure).
-    IMPORTANT: If data lives on CUDA, we force num_workers=0.
-    """
+    # Construct the datamodule with a fixed synthetic buffer and deterministic indices
     n = int(C.shape[0])
     n_train = max(1, int(0.98 * n))
     train_idx = np.arange(0, n_train, dtype=np.int64)
@@ -384,7 +280,6 @@ def build_dm(args, C, X, Y) -> ContextualizedRegressionDataModule:
 
     task_type = args.task_type
     if task_type is None:
-        # Networks wrappers use the univariate convention.
         task_type = "singletask_univariate"
 
     dm = ContextualizedRegressionDataModule(
@@ -416,7 +311,6 @@ def build_dm(args, C, X, Y) -> ContextualizedRegressionDataModule:
 def build_trainer(args, timer: SteadyStateStepTimer) -> pl.Trainer:
     if torch.cuda.is_available():
         accelerator = "gpu"
-        # Under torchrun: each process uses exactly 1 device
         devices = 1 if under_torchrun() else min(args.devices, torch.cuda.device_count())
         strategy = (
             DDPStrategy(
@@ -441,7 +335,7 @@ def build_trainer(args, timer: SteadyStateStepTimer) -> pl.Trainer:
         strategy=strategy,
         precision=map_precision(args.precision),
         max_steps=max_steps,
-        max_epochs=10_000,  # irrelevant when max_steps is set
+        max_epochs=10_000,
         logger=False,
         enable_checkpointing=False,
         enable_progress_bar=False,
@@ -452,12 +346,12 @@ def build_trainer(args, timer: SteadyStateStepTimer) -> pl.Trainer:
         inference_mode=False,
         detect_anomaly=False,
         accumulate_grad_batches=1,
-        limit_val_batches=0,          # no validation
-        use_distributed_sampler=False # IMPORTANT: our synthetic buffer is already identical-sized per rank
+        limit_val_batches=0,
+        use_distributed_sampler=False,
     )
 
 
-# ---------------- benchmark runner ----------------
+# Benchmark runner
 @dataclass
 class Result:
     network: str
@@ -477,21 +371,18 @@ class Result:
 def run_bench(args) -> Result:
     ws = world_size() if under_torchrun() else int(args.devices)
 
-    # Resolve data device
     if args.data_device == "cpu":
         dev = torch.device("cpu")
     elif args.data_device == "cuda":
         dev = torch.device("cuda", local_rank()) if torch.cuda.is_available() else torch.device("cpu")
-    else:  # auto
+    else:
         dev = torch.device("cuda", local_rank()) if torch.cuda.is_available() else torch.device("cpu")
 
-    # Dataloader workers cannot safely handle CUDA tensors
     if dev.type == "cuda" and args.num_workers != 0:
         if is_global_zero():
             print("NOTE: forcing --num-workers=0 because data-device is CUDA.")
         args.num_workers = 0
 
-    # Build fixed synthetic buffer (not timed)
     n = int(args.batch_size * args.buffer_batches)
     tensors = make_synthetic_tensors(
         n=n,
@@ -532,7 +423,7 @@ def run_bench(args) -> Result:
     trainer.fit(model, train_dataloaders=dm.train_dataloader())
 
     measured_wall = timer.measured_wall_time()
-    measured_wall = dist_max(measured_wall)  # slowest rank dictates
+    measured_wall = dist_max(measured_wall)
 
     measured_steps = int(args.steps)
     global_batch = int(args.batch_size * ws)
@@ -568,7 +459,7 @@ def save_result(outdir: str, res: Result) -> str:
     return path
 
 
-# ---------------- main ----------------
+# Entrypoint
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--network", type=str, choices=["correlation", "markov", "bayesian"], default="correlation")
@@ -609,7 +500,7 @@ def main():
     args = parse_args()
 
     if args.data_device == "cpu":
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""  # prevent accidental CUDA use
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     res = run_bench(args)
 

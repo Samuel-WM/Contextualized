@@ -16,14 +16,11 @@ class MultivariateDataset(Dataset):
         self.X = torch.as_tensor(X, dtype=dtype)
         self.Y = torch.as_tensor(Y, dtype=dtype)
 
-        # NEW: stable original-row index for distributed ordered gather
-        # FIX: enforce 1D LongTensor when provided
         if orig_idx is None:
             self.orig_idx = torch.arange(len(self.C), dtype=torch.long)
         else:
             self.orig_idx = torch.as_tensor(orig_idx, dtype=torch.long).view(-1)
 
-        # FIX: derive dims from converted tensors to prevent shape mismatches
         self.c_dim = self.C.shape[-1]
         self.x_dim = self.X.shape[-1]
         self.y_dim = self.Y.shape[-1]
@@ -34,8 +31,8 @@ class MultivariateDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            "idx": idx,                      # dataset-local position
-            "orig_idx": self.orig_idx[idx],  # NEW: original-row id
+            "idx": idx,
+            "orig_idx": self.orig_idx[idx],
             "contexts": self.C[idx],
             "predictors": self.X[idx].expand(self.y_dim, -1),
             "outcomes": self.Y[idx].unsqueeze(-1),
@@ -51,14 +48,11 @@ class UnivariateDataset(Dataset):
         self.X = torch.as_tensor(X, dtype=dtype)
         self.Y = torch.as_tensor(Y, dtype=dtype)
 
-        # NEW: stable original-row index
-        # FIX: enforce 1D LongTensor when provided
         if orig_idx is None:
             self.orig_idx = torch.arange(len(self.C), dtype=torch.long)
         else:
             self.orig_idx = torch.as_tensor(orig_idx, dtype=torch.long).view(-1)
 
-        # FIX: derive dims from converted tensors to prevent shape mismatches
         self.c_dim = self.C.shape[-1]
         self.x_dim = self.X.shape[-1]
         self.y_dim = self.Y.shape[-1]
@@ -70,7 +64,7 @@ class UnivariateDataset(Dataset):
     def __getitem__(self, idx):
         return {
             "idx": idx,
-            "orig_idx": self.orig_idx[idx],  # NEW
+            "orig_idx": self.orig_idx[idx],
             "contexts": self.C[idx],
             "predictors": self.X[idx].expand(self.y_dim, -1).unsqueeze(-1),
             "outcomes": self.Y[idx].expand(self.x_dim, -1).T.unsqueeze(-1),
@@ -86,14 +80,11 @@ class MultitaskMultivariateDataset(Dataset):
         self.X = X.to(dtype) if isinstance(X, torch.Tensor) else torch.as_tensor(X, dtype=dtype)
         self.Y = Y.to(dtype) if isinstance(Y, torch.Tensor) else torch.as_tensor(Y, dtype=dtype)
 
-        # NEW: stable original-row index per sample
-        # FIX: enforce 1D LongTensor when provided
         if orig_idx is None:
             self.orig_idx = torch.arange(len(self.C), dtype=torch.long)
         else:
             self.orig_idx = torch.as_tensor(orig_idx, dtype=torch.long).view(-1)
 
-        # FIX: derive dims from converted tensors to prevent shape mismatches
         self.c_dim = self.C.shape[-1]
         self.x_dim = self.X.shape[-1]
         self.y_dim = self.Y.shape[-1]
@@ -103,21 +94,22 @@ class MultitaskMultivariateDataset(Dataset):
         return len(self.C) * self.y_dim
 
     def __getitem__(self, idx):
+        # Get task-split sample indices
         n_i = idx // self.y_dim
         y_i = idx % self.y_dim
 
-        # Minor improvement: task vector dtype matches dataset dtype
+        # Create a one-hot encoding for the task
         t = torch.zeros(self.y_dim, dtype=self.dtype)
         t[y_i] = 1
 
         return {
-            "idx": idx,                         # dataset-item index
-            "orig_idx": self.orig_idx[n_i],     # NEW: original-row id of the sample
+            "idx": idx,
+            "orig_idx": self.orig_idx[n_i],
             "contexts": self.C[n_i],
             "task": t,
             "predictors": self.X[n_i],
             "outcomes": self.Y[n_i, y_i].unsqueeze(0),
-            "sample_idx": n_i,                  # local sample index within this dataset
+            "sample_idx": n_i,
             "outcome_idx": y_i,
         }
 
@@ -132,14 +124,11 @@ class MultitaskUnivariateDataset(Dataset):
         self.X = torch.as_tensor(X, dtype=dtype)
         self.Y = torch.as_tensor(Y, dtype=dtype)
 
-        # NEW: stable original-row index per sample
-        # FIX: enforce 1D LongTensor when provided
         if orig_idx is None:
             self.orig_idx = torch.arange(len(self.C), dtype=torch.long)
         else:
             self.orig_idx = torch.as_tensor(orig_idx, dtype=torch.long).view(-1)
 
-        # FIX: derive dims from converted tensors to prevent shape mismatches
         self.c_dim = self.C.shape[-1]
         self.x_dim = self.X.shape[-1]
         self.y_dim = self.Y.shape[-1]
@@ -149,17 +138,19 @@ class MultitaskUnivariateDataset(Dataset):
         return len(self.C) * self.x_dim * self.y_dim
 
     def __getitem__(self, idx):
+        # Get task-split sample indices
         n_i = idx // (self.x_dim * self.y_dim)
         x_i = (idx // self.y_dim) % self.x_dim
         y_i = idx % self.y_dim
 
+        # Create a one-hot encoding for the task
         t = torch.zeros(self.x_dim + self.y_dim, dtype=self.dtype)
         t[x_i] = 1
         t[self.x_dim + y_i] = 1
 
         return {
-            "idx": idx,                         # dataset-item index
-            "orig_idx": self.orig_idx[n_i],     # NEW: original-row id of the sample
+            "idx": idx,
+            "orig_idx": self.orig_idx[n_i],
             "contexts": self.C[n_i],
             "task": t,
             "predictors": self.X[n_i, x_i].unsqueeze(0),
