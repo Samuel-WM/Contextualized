@@ -17,7 +17,7 @@ from abc import abstractmethod
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 
 from contextualized.regression.regularizers import REGULARIZERS
 from contextualized.regression.losses import MSE
