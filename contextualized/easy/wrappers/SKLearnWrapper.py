@@ -135,6 +135,7 @@ class SKLearnWrapper:
                 "X_val",
                 "Y_val",
                 "val_split",
+                "random_state",
                 "num_workers",
                 "pin_memory",
                 "persistent_workers",
@@ -143,6 +144,7 @@ class SKLearnWrapper:
                 "shuffle_eval",
                 "dtype",
             ],
+
             "model": [
                 "loss_fn",
                 "link_fn",
@@ -402,7 +404,7 @@ class SKLearnWrapper:
         Y_val: Optional[np.ndarray],
         Y_required: bool,
         val_split: float,
-        random_state: int = 42,
+        random_state: Optional[int] = None,
         shuffle: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray, Optional[np.ndarray]]:
         if (
@@ -430,13 +432,13 @@ class SKLearnWrapper:
         if vs <= 0.0:
             return C, X, Y, np.arange(n), None
 
-        tr_idx, va_idx = train_test_split(
-            np.arange(n),
-            test_size=vs,
-            shuffle=shuffle,
-            random_state=random_state,
-        )
+        split_kwargs = dict(test_size=vs, shuffle=shuffle)
+        if random_state is not None:
+            split_kwargs["random_state"] = random_state
+
+        tr_idx, va_idx = train_test_split(np.arange(n), **split_kwargs)
         return C, X, Y, tr_idx, va_idx
+
 
     def _build_datamodule(
         self,
@@ -764,7 +766,9 @@ class SKLearnWrapper:
             Y_val=Y_val,
             Y_required=True,
             val_split=val_split,
+            random_state=organized["data"].get("random_state", None),
         )
+
 
         for b in range(self.n_bootstraps):
             model_kwargs = dict(organized["model"])

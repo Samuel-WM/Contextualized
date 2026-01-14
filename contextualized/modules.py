@@ -7,6 +7,7 @@ from torch import nn
 
 from contextualized.functions import LINK_FUNCTIONS
 
+
 def _resolve_link_fn(maybe_link):
     """
     Accepts either:
@@ -78,11 +79,12 @@ class SoftSelect(nn.Module):
 
 
 class Explainer(SoftSelect):
-    """ 2D subtype-archetype parameter sharing """
+    """
+    2D subtype-archetype parameter sharing
+    """
+
     def __init__(self, k, out_shape):
         super().__init__((k,), out_shape)
-
-
 
 
 class MLP(nn.Module):
@@ -110,7 +112,6 @@ class MLP(nn.Module):
         self.mlp = nn.Sequential(*mlp_layers)
         self.link_fn = _resolve_link_fn(link_fn)
 
-
     def forward(self, X):
         """Torch Forward pass."""
         ret = self.mlp(X)
@@ -119,9 +120,7 @@ class MLP(nn.Module):
 
 class NGAM(nn.Module):
     """
-    Neural generalized additive model: sum_i f_i(x_i).
-    Each f_i is an MLP that outputs (B, output_dim).
-    The final link function is applied once to the summed output.
+    Neural generalized additive model
     """
 
     def __init__(
@@ -137,6 +136,7 @@ class NGAM(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
+        # Each feature-wise network uses an identity link; the global link is applied once.
         per_feat_link = "identity"
 
         self.nams = nn.ModuleList(
@@ -155,12 +155,11 @@ class NGAM(nn.Module):
         self.link_fn = _resolve_link_fn(link_fn)
 
     def forward(self, X):
-        """X: (B, input_dim)"""
+        """Torch Forward pass."""
         ret = self.nams[0](X[:, 0].unsqueeze(-1))
         for i, nam in enumerate(self.nams[1:], start=1):
             ret += nam(X[:, i].unsqueeze(-1))
         return self.link_fn(ret)
-
 
 
 class Linear(nn.Module):
